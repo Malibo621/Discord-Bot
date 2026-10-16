@@ -1,18 +1,27 @@
 """أوامر الإدارة: تحذير، كتم، طرد، حظر، مسح الرسائل، قفل الرومات."""
 from __future__ import annotations
 
-from datetime import timedelta
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import ui
+from bot import cards, images, ui
 from bot.checks import require
 from bot.utils import can_act_on, human_duration, parse_duration, ts
 
 MAX_TIMEOUT = timedelta(days=28)
+log = logging.getLogger("bot.moderation")
+STAGES = {1: "الإنذار الأول", 2: "الإنذار الثاني", 3: "الإنذار الثالث"}
+
+
+def stage_label(count: int) -> str:
+    """مرحلة الإنذار من العدد الفعلي للتحذيرات النشطة (لا من نص ثابت)."""
+    return STAGES.get(count, f"الإنذار رقم {count}")
 
 
 class Moderation(commands.Cog):
@@ -45,6 +54,28 @@ class Moderation(commands.Cog):
         return True
 
     # ------------------------------------------------------------------ التحذير
+    async def _display_user(self, guild: discord.Guild, user_id: int):
+        user = guild.get_member(user_id)
+        if user is None:
+            try:
+                user = await self.bot.fetch_user(user_id)
+            except discord.HTTPException:
+                user = None
+        return user
+
+    async def _log_ids(self, guild: discord.Guild, action: str, user_id: int, admin: discord.abc.User, reason: str,
+                       extra: str = "", color: int = ui.Colors.MOD):
+        user = await self._display_user(guild, user_id)
+        e = ui.info(f"{ui.Icons.HAMMER} {action}", color=color)
+        e.add_field(name="العضو", value=f"<@{user_id}>\n`{user_id}`")
+        e.add_field(name="المسؤول", value=admin.mention)
+        e.add_field(name="السبب", value=reason or "بدون سبب", inline=False)
+        if extra:
+            e.add_field(name="تفاصيل", value=extra, inline=False)
+        if user is not None:
+            e.set_thumbnail(url=user.display_avatar.url)
+        await self.bot.send_log(guild, "mod", e)
+
     @app_commands.command(name="warn", description="تحذير عضو")
     @app_commands.describe(member="العضو", reason="سبب التحذير")
     @app_commands.guild_only()
@@ -53,19 +84,33 @@ class Moderation(commands.Cog):
                    reason: app_commands.Range[str, 1, 400]):
         if not await self._guard(interaction, member):
             return
-        await self.apply_warning(interaction.guild, member, interaction.user, reason)
-        count = len(await self.bot.db.warnings(interaction.guild_id, member.id))
-        await ui.reply(interaction, ui.brand(ui.warning(
-            "تم تحذير العضو", f"{member.mention} — التحذير رقم **{count}**\n**السبب:** {reason}"), interaction.guild))
+        wid, count, dup = await self.apply_warning_ex(interaction.guild, member, interaction.user, reason)
+        if dup:   # نفس التحذير بالضبط قبل لحظات (ضغط/تفاعل مكرر): لا تسجيل ولا عقوبة ولا إشعار ثان
+            return await ui.reply(interaction, ui.warning(
+                "سُجّل هذا التحذير للتو", f"لم يُضَف تحذير مكرر لـ {member.mention}.\n"
+                                          f"التحذيرات النشطة: **{count}**"), ephemeral=True)
+        e = ui.warning(f"تم تحذير العضو — {stage_label(count)}",
+                       f"{member.mention}\n**السبب:** {reason}")
+        e.add_field(name="رقم التحذير", value=f"`#{wid}`")
+        e.add_field(name="التحذيرات النشطة", value=f"**{count}**")
+        await ui.reply(interaction, ui.brand(e, interaction.guild))
 
     async def apply_warning(self, guild: discord.Guild, member: discord.Member, mod: discord.abc.User,
                             reason: str) -> int:
-        """يُستخدم أيضًا من نظام الحماية للتحذير التلقائي."""
+        """يُستخدم من نظام الحماية للتحذير التلقائي. يرجع عدد التحذيرات النشطة."""
+        return (await self.apply_warning_ex(guild, member, mod, reason))[1]
+
+    async def apply_warning_ex(self, guild: discord.Guild, member: discord.Member, mod: discord.abc.User,
+                               reason: str) -> tuple[int, int, bool]:
+        """يسجّل التحذير مرة واحدة ويطبّق إعدادات العقوبة التلقائية القائمة (كما هي، دون تغيير)."""
         db = self.bot.db
-        count = await db.add_warning(guild.id, member.id, mod.id, reason)
+        wid, count, dup = await db.add_warning_ex(guild.id, member.id, mod.id, reason)
+        if dup:
+            return wid, count, True
         s = await db.get_settings(guild.id)
-        await self._dm(member, guild, "تلقيت تحذيرًا", reason, f"عدد تحذيراتك: **{count}**")
-        await self._log(guild, f"تحذير (#{count})", member, mod, reason, color=ui.Colors.WARNING)
+        await self._dm(member, guild, f"تلقيت تحذيرًا — {stage_label(count)}", reason,
+                       f"عدد تحذيراتك النشطة: **{count}**")
+        await self._log(guild, f"تحذير (#{wid}) — {stage_label(count)}", member, mod, reason, color=ui.Colors.WARNING)
 
         if s["warn_kick_threshold"] and count >= s["warn_kick_threshold"]:
             try:
@@ -82,36 +127,83 @@ class Moderation(commands.Cog):
                                 f"المدة: {human_duration(duration)}")
             except discord.HTTPException:
                 pass
-        return count
+        return wid, count, False
 
-    @app_commands.command(name="warnings", description="عرض تحذيرات عضو")
+    @app_commands.command(name="warnings", description="عرض سجل تحذيرات عضو (بطاقة مرئية)")
+    @app_commands.describe(member="العضو الذي تريد عرض تحذيراته")
     @app_commands.guild_only()
     @require("moderation")
     async def warnings(self, interaction: discord.Interaction, member: discord.Member):
-        rows = await self.bot.db.warnings(interaction.guild_id, member.id)
+        db = self.bot.db
+        rows = await db.warnings(interaction.guild_id, member.id)
         if not rows:
             return await ui.reply(interaction, ui.success("سجل نظيف", f"{member.mention} ليس لديه تحذيرات."),
                                   ephemeral=True)
-        lines = [f"`#{w['id']}` {ts(w['created_at'], 'd')} • <@{w['mod_id']}>\n└ {w['reason']}" for w in rows[:20]]
-        e = ui.info(f"⚠️ تحذيرات {member.display_name} ({len(rows)})", "\n".join(lines), ui.Colors.WARNING)
+        active = sum(1 for w in rows if w["status"] == "active")
+        revoked = len(rows) - active
+        s = await db.get_settings(interaction.guild_id)
+        guild = interaction.guild
+
+        def mod_name(mid: int) -> str:
+            if mid == self.bot.user.id:
+                return "النظام (تلقائي)"
+            m = guild.get_member(mid)
+            return m.display_name if m else f"مسؤول {mid}"
+
+        if s["info_cards"] and cards.available():
+            try:
+                await interaction.response.defer(ephemeral=True)
+                avatar = await images.avatar(member)
+                pages = max(1, (len(rows) + 3) // 4)
+
+                async def render(index: int):
+                    chunk = rows[index * 4:(index + 1) * 4]
+                    items = [dict(id=w["id"], date=datetime.fromtimestamp(w["created_at"], timezone.utc).strftime("%Y-%m-%d"),
+                                  mod=mod_name(w["mod_id"]), reason=w["reason"], status=w["status"]) for w in chunk]
+                    png = await asyncio.to_thread(
+                        cards.render_warnings, name=member.display_name, avatar=avatar, active=active, revoked=revoked,
+                        stage=stage_label(active) if active else "لا إنذارات نشطة", items=items, page=index + 1,
+                        pages=pages, guild_name=guild.name)
+                    return png, f"سجل تحذيرات {member.display_name}: {active} نشطة و{revoked} ملغاة"
+
+                view = ui.ImagePaginator(interaction.user.id, pages, render, in_embed=s["game_image_in_embed"],
+                                         name="warnings.png")
+                return await view.start(interaction, ephemeral=True)
+            except Exception:  # noqa: BLE001 - فشل الرسم لا يعطّل الأمر
+                log.exception("Warnings card failed; using text fallback")
+        lines = []
+        for w in rows[:15]:
+            state = "🟢 نشط" if w["status"] == "active" else "⚪ ملغى"
+            lines.append(f"`#{w['id']}` {state} • {ts(w['created_at'], 'd')} • {mod_name(w['mod_id'])}\n└ {w['reason']}")
+        e = ui.info(f"⚠️ تحذيرات {member.display_name}  ({active} نشطة · {revoked} ملغاة)", "\n".join(lines),
+                    ui.Colors.WARNING)
         e.set_thumbnail(url=member.display_avatar.url)
         await ui.reply(interaction, e, ephemeral=True)
 
-    @app_commands.command(name="delwarn", description="حذف تحذير برقمه")
+    @app_commands.command(name="delwarn", description="إلغاء تحذير برقمه (يبقى في السجل كملغى)")
+    @app_commands.describe(warn_id="رقم التحذير (يظهر في /warnings)", reason="سبب الإلغاء (اختياري، يُسجَّل)")
     @app_commands.guild_only()
     @require("moderation")
-    async def delwarn(self, interaction: discord.Interaction, warn_id: int):
-        ok = await self.bot.db.delete_warning(interaction.guild_id, warn_id)
-        await ui.reply(interaction, ui.success("تم حذف التحذير") if ok else ui.error("رقم التحذير غير موجود."),
+    async def delwarn(self, interaction: discord.Interaction, warn_id: int, reason: Optional[str] = None):
+        row = await self.bot.db.revoke_warning(interaction.guild_id, warn_id, interaction.user.id, reason or "")
+        if not row:
+            return await ui.reply(interaction, ui.error("رقم التحذير غير موجود أو ملغى مسبقًا."), ephemeral=True)
+        await ui.reply(interaction, ui.success("تم إلغاء التحذير",
+                                               f"`#{warn_id}` لـ <@{row['user_id']}> صار «ملغى» ولن يُحتسب."),
                        ephemeral=True)
+        await self._log_ids(interaction.guild, f"إلغاء تحذير (#{warn_id})", row["user_id"], interaction.user,
+                            reason or "بدون سبب", f"السبب الأصلي: {row['reason']}", ui.Colors.LOG)
 
-    @app_commands.command(name="clearwarns", description="مسح كل تحذيرات عضو")
+    @app_commands.command(name="clearwarns", description="إلغاء كل التحذيرات النشطة لعضو (تبقى في السجل)")
+    @app_commands.describe(member="العضو الذي ستُلغى كل تحذيراته النشطة", reason="سبب الإلغاء (اختياري، يُسجَّل)")
     @app_commands.guild_only()
     @require("moderation")
-    async def clearwarns(self, interaction: discord.Interaction, member: discord.Member):
-        n = await self.bot.db.clear_warnings(interaction.guild_id, member.id)
-        await ui.reply(interaction, ui.success("تم المسح", f"حُذف **{n}** تحذير من {member.mention}"))
-        await self._log(interaction.guild, "مسح التحذيرات", member, interaction.user, f"{n} تحذير")
+    async def clearwarns(self, interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
+        n = await self.bot.db.revoke_all_warnings(interaction.guild_id, member.id, interaction.user.id, reason or "")
+        await ui.reply(interaction, ui.success("تم الإلغاء", f"أُلغي **{n}** تحذير نشط لـ {member.mention} "
+                                                              "(تبقى مسجّلة كملغاة)."))
+        await self._log(interaction.guild, "إلغاء كل التحذيرات", member, interaction.user,
+                        reason or "بدون سبب", f"{n} تحذير", color=ui.Colors.LOG)
 
     # ------------------------------------------------------------------ الكتم
     @app_commands.command(name="mute", description="كتم عضو مؤقتًا (Timeout)")

@@ -259,3 +259,42 @@ def render_nowplaying(*, title: str, requester: str, duration: str, thumbnail: O
         c.stat((x1 - w, 236, x1, 306), k, v, WHITE, 24)
     c.footer(guild_name)
     return c.png()
+
+
+# ---------------------------------------------------------------------- سجل التحذيرات
+STAGE_COLORS = {0: GREEN, 1: AMBER, 2: (255, 138, 76), 3: RED}
+
+
+def render_warnings(*, name: str, avatar: Optional[bytes], active: int, revoked: int, stage: str,
+                    items: Sequence[dict], page: int, pages: int, guild_name: str) -> bytes:
+    """items: [{id, date, mod, reason, status('active'|'revoked'), note}] حتى 4 صفوف في الصفحة."""
+    c = Canvas("warnings")
+    col = STAGE_COLORS.get(min(active, 3), RED)
+    c.header(None, False, f"صفحة {page} من {pages}", title="سجل التحذيرات")
+    c.rr((22, 52, LW - 22, 130), 20, fill=PANEL + (232,), outline=col + (190,), width=2)
+    c.avatar(avatar, LW - 22 - 24 - 28, 91, 56, col, name)
+    nx = LW - 22 - 24 - 56 - 14
+    c.text(name_of(name, 22), nx, 77, 24, WHITE, anchor="rm", max_w=250)
+    c.pill((nx - 150, 94, nx, 116), col + (50,), col + (230,), 1.2)
+    c.text(stage, nx - 75, 105, 14, WHITE, shadow=False, max_w=140)
+    c.stat((30, 60, 118, 122), "نشطة", _num(active), col, 22)
+    c.stat((126, 60, 214, 122), "ملغاة", _num(revoked), MUTED, 22)
+    top, rh = 138, 46
+    for i, it in enumerate(items[:4]):
+        y = top + i * (rh + 4)
+        live = it["status"] == "active"
+        c.rr((22, y, LW - 22, y + rh), 14, fill=PANEL + ((226 if live else 150),), outline=(col if live else MUTED) + (150,),
+             width=1.2)
+        c.pill((LW - 34 - 52, y + 6, LW - 34, y + 24), (col if live else MUTED) + (60,), None)
+        c.text(f"#{it['id']}", LW - 34 - 26, y + 15, 13, WHITE if live else MUTED, shadow=False)
+        c.text(f"{it['date']}  ·  {name_of(it['mod'], 16)}", LW - 34 - 62, y + 15, 12.5, MUTED, anchor="rm",
+               shadow=False, max_w=300)
+        c.text(it["reason"] or "بدون سبب", LW - 34, y + 33, 14.5, WHITE if live else MUTED, anchor="rm",
+               max_w=LW - 150, shadow=False)
+        chip = "نشط" if live else "ملغى"
+        c.pill((34, y + 12, 34 + 62, y + 34), (GREEN if live else MUTED) + (50,), (GREEN if live else MUTED) + (190,), 1)
+        c.text(chip, 34 + 31, y + 23, 13.5, GREEN if live else MUTED, shadow=False)
+    if not items:
+        c.text("سجل نظيف — لا تحذيرات", LW / 2, 230, 26, MUTED, shadow=False)
+    c.footer(guild_name)
+    return c.png()

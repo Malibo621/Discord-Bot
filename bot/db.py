@@ -179,6 +179,12 @@ class Database:
         cols = {r["name"] for r in await self.fetchall("PRAGMA table_info(shop_items)")}
         if "image_url" not in cols:
             await self.conn.execute("ALTER TABLE shop_items ADD COLUMN image_url TEXT")
+        wcols = {r["name"] for r in await self.fetchall("PRAGMA table_info(warnings)")}
+        for col, ddl in (("status", "TEXT NOT NULL DEFAULT 'active'"), ("revoked_by", "INTEGER"),
+                         ("revoked_at", "INTEGER"), ("revoke_reason", "TEXT")):
+            if col not in wcols:      # التحذيرات القديمة تصبح active تلقائيًا ولا يُحذف منها شيء
+                await self.conn.execute(f"ALTER TABLE warnings ADD COLUMN {col} {ddl}")
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_warn_user ON warnings (guild_id, user_id, id DESC)")
         if "deleted" not in cols:   # حذف «ناعم»: يُخفي المنتج نهائيًا مع بقاء المشتريات والسجلات سليمة
             await self.conn.execute("ALTER TABLE shop_items ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
 
@@ -695,27 +701,81 @@ class Database:
         )
 
     # ------------------------------------------------------------------ التحذيرات
+    DUPLICATE_WINDOW = 8   # ثوانٍ: نفس التحذير (عضو + مسؤول + سبب) خلالها يُعدّ تكرارًا للتفاعل نفسه
+
+    async def add_warning_ex(self, guild_id: int, user_id: int, mod_id: int, reason: str) -> tuple[int, int, bool]:
+        """يسجّل تحذيرًا ويرجع (معرّفه، عدد التحذيرات النشطة، هل هو تكرار لتحذير حديث مطابق).
+
+        الفحص والإدراج في معاملة واحدة، فلا يُسجَّل التحذير نفسه مرتين مهما تكرر التفاعل أو تزامن.
+        """
+        reason = (reason or "").strip()
+        async with self.tx() as conn:
+            async with conn.execute(
+                "SELECT id FROM warnings WHERE guild_id=? AND user_id=? AND mod_id=? AND reason=? "
+                "AND status='active' AND created_at >= ? ORDER BY id DESC LIMIT 1",
+                (guild_id, user_id, mod_id, reason, now() - self.DUPLICATE_WINDOW),
+            ) as cur:
+                dup = await cur.fetchone()
+            if dup:
+                wid, duplicate = dup["id"], True
+            else:
+                cur = await conn.execute(
+                    "INSERT INTO warnings (guild_id, user_id, mod_id, reason, created_at, status) "
+                    "VALUES (?, ?, ?, ?, ?, 'active')", (guild_id, user_id, mod_id, reason, now()))
+                wid, duplicate = cur.lastrowid, False
+            async with conn.execute(
+                "SELECT COUNT(*) AS c FROM warnings WHERE guild_id=? AND user_id=? AND status='active'",
+                (guild_id, user_id),
+            ) as cur:
+                count = (await cur.fetchone())["c"]
+            return wid, count, duplicate
+
     async def add_warning(self, guild_id: int, user_id: int, mod_id: int, reason: str) -> int:
-        await self.execute(
-            "INSERT INTO warnings (guild_id, user_id, mod_id, reason, created_at) VALUES (?, ?, ?, ?, ?)",
-            (guild_id, user_id, mod_id, reason, now()),
-        )
-        row = await self.fetchone(
-            "SELECT COUNT(*) AS c FROM warnings WHERE guild_id=? AND user_id=?", (guild_id, user_id)
-        )
+        """للتوافق: يرجع عدد التحذيرات النشطة بعد الإضافة."""
+        return (await self.add_warning_ex(guild_id, user_id, mod_id, reason))[1]
+
+    async def warnings(self, guild_id: int, user_id: int, include_revoked: bool = True):
+        sql = "SELECT * FROM warnings WHERE guild_id=? AND user_id=?"
+        if not include_revoked:
+            sql += " AND status='active'"
+        return await self.fetchall(sql + " ORDER BY id DESC", (guild_id, user_id))
+
+    async def active_warning_count(self, guild_id: int, user_id: int) -> int:
+        row = await self.fetchone("SELECT COUNT(*) AS c FROM warnings WHERE guild_id=? AND user_id=? AND status='active'",
+                                  (guild_id, user_id))
         return row["c"]
 
-    async def warnings(self, guild_id: int, user_id: int):
-        return await self.fetchall(
-            "SELECT * FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC", (guild_id, user_id)
-        )
+    async def warning(self, guild_id: int, warn_id: int):
+        return await self.fetchone("SELECT * FROM warnings WHERE guild_id=? AND id=?", (guild_id, warn_id))
 
-    async def delete_warning(self, guild_id: int, warn_id: int) -> bool:
+    async def revoke_warning(self, guild_id: int, warn_id: int, admin_id: int, reason: str = ""):
+        """إلغاء ناعم: يبقى السجل للتتبع لكنه لا يُحتسب. يرجع الصف إن أُلغي الآن، وإلا None (غير موجود/ملغى)."""
+        async with self.tx() as conn:
+            async with conn.execute(
+                "SELECT * FROM warnings WHERE guild_id=? AND id=? AND status='active'", (guild_id, warn_id)
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                return None
+            await conn.execute(
+                "UPDATE warnings SET status='revoked', revoked_by=?, revoked_at=?, revoke_reason=? WHERE id=?",
+                (admin_id, now(), reason or None, warn_id))
+            return row
+
+    async def revoke_all_warnings(self, guild_id: int, user_id: int, admin_id: int, reason: str = "") -> int:
+        async with self.tx() as conn:
+            cur = await conn.execute(
+                "UPDATE warnings SET status='revoked', revoked_by=?, revoked_at=?, revoke_reason=? "
+                "WHERE guild_id=? AND user_id=? AND status='active'",
+                (admin_id, now(), reason or None, guild_id, user_id))
+            return cur.rowcount
+
+    async def delete_warning(self, guild_id: int, warn_id: int) -> bool:   # قديم: لم يعد تستخدمه الأوامر
         async with self._lock:
             cur = await self.conn.execute("DELETE FROM warnings WHERE guild_id=? AND id=?", (guild_id, warn_id))
             return cur.rowcount > 0
 
-    async def clear_warnings(self, guild_id: int, user_id: int) -> int:
+    async def clear_warnings(self, guild_id: int, user_id: int) -> int:     # قديم: لم يعد تستخدمه الأوامر
         async with self._lock:
             cur = await self.conn.execute(
                 "DELETE FROM warnings WHERE guild_id=? AND user_id=?", (guild_id, user_id)

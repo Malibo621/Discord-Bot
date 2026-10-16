@@ -1821,6 +1821,211 @@ async def test_role_settings_in_panel():
     print("OK role-type settings: parse/format, panel picker, @everyone blocked, non-admin blocked, clear")
 
 
+# ====================================================================== التحذيرات
+async def test_warnings_db_and_migration():
+    import sqlite3
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        path = os.path.join(d, "old.db")
+        # قاعدة قديمة بجدول تحذيرات بالشكل السابق (بدون أعمدة الحالة) وفيها بيانات حقيقية
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, "
+                  "user_id INTEGER NOT NULL, mod_id INTEGER NOT NULL, reason TEXT, created_at INTEGER NOT NULL)")
+        c.execute("INSERT INTO warnings (guild_id,user_id,mod_id,reason,created_at) VALUES (1,5,9,'قديم',100)")
+        c.commit()
+        c.close()
+        db = Database(path)
+        await db.connect()
+        try:
+            old = await db.warnings(1, 5)
+            assert len(old) == 1 and old[0]["status"] == "active" and old[0]["reason"] == "قديم"   # لم يضِع شيء
+            assert await db.active_warning_count(1, 5) == 1
+            # إضافة + منع التكرار (نفس العضو والمسؤول والسبب خلال النافذة)
+            wid, count, dup = await db.add_warning_ex(1, 5, 9, "سبب جديد")
+            assert (count, dup) == (2, False)
+            wid2, count2, dup2 = await db.add_warning_ex(1, 5, 9, "سبب جديد")
+            assert (wid2, count2, dup2) == (wid, 2, True)
+            res = await asyncio.gather(*[db.add_warning_ex(1, 6, 9, "تزامن") for _ in range(12)])
+            assert sum(1 for r in res if not r[2]) == 1 and await db.active_warning_count(1, 6) == 1
+            # سبب مختلف أو مسؤول مختلف = تحذير جديد
+            assert (await db.add_warning_ex(1, 6, 9, "سبب آخر"))[1] == 2
+            assert (await db.add_warning_ex(1, 6, 10, "تزامن"))[1] == 3
+            # بعد انتهاء نافذة التكرار يُسجَّل من جديد
+            await db.execute("UPDATE warnings SET created_at=created_at-100 WHERE guild_id=1 AND user_id=6")
+            assert (await db.add_warning_ex(1, 6, 9, "تزامن"))[2] is False
+            # الإلغاء الناعم: يبقى السجل ولا يُحتسب، ولا يمكن إلغاؤه مرتين، ولا يلغي من سيرفر آخر
+            row = await db.revoke_warning(1, wid, 77, "تمت المراجعة")
+            assert row and row["reason"] == "سبب جديد" and await db.active_warning_count(1, 5) == 1
+            assert await db.revoke_warning(1, wid, 77, "") is None and await db.revoke_warning(2, wid, 77, "") is None
+            rec = await db.warning(1, wid)
+            assert (rec["status"], rec["revoked_by"], rec["revoke_reason"]) == ("revoked", 77, "تمت المراجعة")
+            assert len(await db.warnings(1, 5)) == 2 and len(await db.warnings(1, 5, include_revoked=False)) == 1
+            # إلغاء الكل
+            assert await db.revoke_all_warnings(1, 6, 77, "تنظيف") == 4 and await db.active_warning_count(1, 6) == 0
+            assert await db.revoke_all_warnings(1, 6, 77, "") == 0
+            assert len(await db.warnings(1, 6)) == 4                      # لا حذف: كلها ما زالت في السجل
+            # استمرار البيانات بعد إعادة التشغيل (إغلاق وفتح)
+            await db.close()
+            db = Database(path)
+            await db.connect()
+            assert [w["status"] for w in await db.warnings(1, 5)] == ["revoked", "active"]
+            assert await db.active_warning_count(1, 6) == 0 and len(await db.warnings(1, 6)) == 4
+            assert await db.add_warning(1, 5, 9, "بعد الريستارت") == 2
+        finally:
+            await db.close()
+    print("OK warnings DB: old-schema migration keeps data, dedupe (12 concurrent = 1), soft revoke, guild isolation, persistence")
+
+
+async def test_warnings_commands():
+    from bot import cards
+    from bot.checks import NoPermission
+    from cogs import moderation as modm
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            bot._connection.user = SimpleNamespace(id=999)
+            bot.send_log = AsyncMock()
+            cog = bot.get_cog("Moderation")
+            cog._guard = AsyncMock(return_value=True)                 # فحوص التسلسل الهرمي لها اختبارها
+            mm = sys.modules[type(cog).__module__]
+            assert [mm.stage_label(n) for n in (1, 2, 3, 4, 10)] == ["الإنذار الأول", "الإنذار الثاني", "الإنذار الثالث",
+                                                                      "الإنذار رقم 4", "الإنذار رقم 10"]
+            admin = fake_member(1, admin=True)
+            normal = fake_member(2)
+            staff = fake_member(3, role_ids=(700,))
+            await db.set_perm_roles(GUILD, "moderation", [700])
+
+            # ---- الصلاحيات من الخادم لكل أمر: العضو العادي ممنوع، صاحب رتبة الإدارة مسموح
+            for cmd in (cog.warn, cog.warnings, cog.delwarn, cog.clearwarns):
+                for user, allowed_ in ((normal, False), (staff, True), (admin, True)):
+                    i = fake_interaction(user)
+                    i.client = bot
+                    try:
+                        ok = await cmd._check_can_run(i)
+                    except NoPermission:
+                        ok = False
+                    assert ok == allowed_, (cmd.name, user.id)
+
+            def target(uid):
+                t = fake_member(uid)
+                t.display_name = f"عضو{uid}"
+                t.send = AsyncMock()
+                t.timeout = AsyncMock()
+                t.kick = AsyncMock()
+                t.display_avatar = SimpleNamespace(url="https://x/a.png", with_size=lambda n: SimpleNamespace(
+                    read=AsyncMock(return_value=b"junk")))
+                return t
+
+            t = target(50)
+            guild = MagicMock()
+            guild.id, guild.name = GUILD, "Test"
+            guild.me = SimpleNamespace(id=999, mention="<@999>")
+            guild.get_member = lambda uid: t if uid == 50 else None
+
+            # ---- /warn: تسجيل، مرحلة الإنذار من العدد الفعلي، DM للعضو بلا كشف المسؤول، سجل إداري
+            def winter(user=staff):
+                i = fake_interaction(user)
+                i.guild = guild
+                i.user = user
+                i.original_response = AsyncMock(return_value=MagicMock())
+                return i
+
+            i = winter()
+            await cog.warn.callback(cog, i, member=t, reason="سبب أول")
+            emb = i.response.send_message.await_args.kwargs["embed"]
+            assert "الإنذار الأول" in emb.title and {f.name: f.value for f in emb.fields}["التحذيرات النشطة"] == "**1**"
+            dm = t.send.await_args.kwargs["embed"]
+            assert "سبب أول" in dm.description and "<@3>" not in str(dm.to_dict()) and "الإنذار الأول" in dm.title
+            assert bot.send_log.await_count >= 1
+            i = winter()
+            await cog.warn.callback(cog, i, member=t, reason="سبب ثان")
+            assert "الإنذار الثاني" in i.response.send_message.await_args.kwargs["embed"].title
+            # تفاعل مكرر لنفس التحذير: لا صف جديد ولا DM ولا سجل ولا عقوبة
+            sends, logs = t.send.await_count, bot.send_log.await_count
+            i = winter()
+            await cog.warn.callback(cog, i, member=t, reason="سبب ثان")
+            assert "للتو" in i.response.send_message.await_args.kwargs["embed"].title
+            assert i.response.send_message.await_args.kwargs["ephemeral"] is True
+            assert t.send.await_count == sends and bot.send_log.await_count == logs
+            assert await db.active_warning_count(GUILD, 50) == 2
+            # الثالث: العقوبة التلقائية القائمة (كتم عند 3) تبقى كما هي دون تغيير
+            i = winter()
+            await cog.warn.callback(cog, i, member=t, reason="سبب ثالث")
+            assert "الإنذار الثالث" in i.response.send_message.await_args.kwargs["embed"].title
+            t.timeout.assert_awaited_once()
+            t.kick.assert_not_awaited()                              # لا طرد/حظر تلقائي دون إعداد صريح
+
+            # ---- /warnings: بطاقة مرئية بصفحات (5 تحذيرات = صفحتان) وسرّية للمسؤول فقط
+            for n in range(3):
+                await db.add_warning_ex(GUILD, 50, 3, f"سبب إضافي طويل جدًا {n} " * 5)
+            i = winter()
+            i.followup = MagicMock()
+            i.followup.send = AsyncMock()
+            await cog.warnings.callback(cog, i, member=t)
+            kw = i.followup.send.await_args.kwargs
+            assert kw["ephemeral"] is True and kw["file"].filename == "warnings.png" and kw["view"] is not None
+            # لا سجل: رسالة سرّية
+            i = winter()
+            await cog.warnings.callback(cog, i, member=target(51))
+            assert i.response.send_message.await_args.kwargs["ephemeral"] is True
+            # فشل الرسم: بديل نصي منظم بحالات النشط/الملغى
+            real = cards.render_warnings
+            cards.render_warnings = lambda **k: (_ for _ in ()).throw(RuntimeError("x"))
+            try:
+                i = winter()
+                i.followup = MagicMock()
+                i.followup.send = AsyncMock()
+                await cog.warnings.callback(cog, i, member=t)
+                txt = (i.followup.send.await_args or i.response.send_message.await_args).kwargs["embed"]
+                assert "نشط" in txt.description and "سبب أول" in txt.description
+            finally:
+                cards.render_warnings = real
+
+            # ---- /delwarn: إلغاء ناعم + تسجيل إداري + لا يلغي مرتين
+            first = (await db.warnings(GUILD, 50))[-1]["id"]
+            bot.send_log.reset_mock()
+            i = winter()
+            await cog.delwarn.callback(cog, i, warn_id=first, reason="خطأ إداري")
+            assert "تم إلغاء" in i.response.send_message.await_args.kwargs["embed"].title
+            logged = bot.send_log.await_args.args[2]
+            assert "إلغاء تحذير" in logged.title and "خطأ إداري" in str(logged.to_dict()) and "سبب أول" in str(logged.to_dict())
+            assert await db.active_warning_count(GUILD, 50) == 5 and (await db.warning(GUILD, first))["status"] == "revoked"
+            i = winter()
+            await cog.delwarn.callback(cog, i, warn_id=first, reason=None)
+            assert "غير موجود" in i.response.send_message.await_args.kwargs["embed"].description
+            i = winter()
+            await cog.delwarn.callback(cog, i, warn_id=99999, reason=None)
+            assert i.response.send_message.await_args.kwargs["ephemeral"] is True
+            # ---- /clearwarns: يلغي الكل ويسجل ولا يحذف
+            bot.send_log.reset_mock()
+            i = winter()
+            await cog.clearwarns.callback(cog, i, member=t, reason="بداية جديدة")
+            assert await db.active_warning_count(GUILD, 50) == 0 and len(await db.warnings(GUILD, 50)) == 6
+            assert "إلغاء كل التحذيرات" in bot.send_log.await_args.args[2].title
+
+            # ---- /userinfo يعدّ النشطة فقط
+            assert await db.active_warning_count(GUILD, 50) == 0
+        finally:
+            await db.close()
+    print("OK warnings commands: server-side permissions per command, stage from real count, DM w/o admin identity, "
+          "dup-click ignored, existing auto-timeout kept (no auto kick/ban), card + paging + text fallback, "
+          "revoke logged and non-destructive")
+
+
+def test_warnings_card():
+    from PIL import Image
+    from bot import cards
+    import io as _io
+    items = [dict(id=i, date="2026-10-17", mod=n, reason=r, status=st) for i, (n, r, st) in enumerate([
+        ("محمد", "x" * 300, "active"), ("A" * 60, "", "revoked"), ("🔥", "سبب قصير", "active"), ("النظام (تلقائي)", "ب", "revoked")], 1)]
+    for count in (0, 1, 2, 3, 9):
+        for its in (items, items[:1], []):
+            png = cards.render_warnings(name="محمد عبدالله الطويل جدًا", avatar=b"junk", active=count, revoked=2,
+                                        stage="الإنذار الثاني", items=its, page=1, pages=3, guild_name="g" * 80)
+            assert Image.open(_io.BytesIO(png)).size == (1280, 720)
+    print("OK warnings card: 1280x720 with long text, empty list, bad avatar, all severity levels")
+
+
 GUESSING = False
 test_game_logic()
 test_wheel()
@@ -1832,6 +2037,9 @@ asyncio.run(test_commands_panel())
 asyncio.run(test_shop_store_and_panel())
 asyncio.run(test_shop_purchases())
 asyncio.run(test_role_settings_in_panel())
+asyncio.run(test_warnings_db_and_migration())
+asyncio.run(test_warnings_commands())
+test_warnings_card()
 test_info_cards()
 asyncio.run(test_info_commands_use_cards_with_fallback())
 asyncio.run(test_fast_game_and_trigger())

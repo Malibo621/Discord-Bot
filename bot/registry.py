@@ -64,6 +64,8 @@ OPTION_DOCS: dict[tuple[str, str], str] = {
     ("game remove-content", "content_id"): "رقم الكلمة أو السؤال المراد حذفه (يظهر في /game content)",
     ("music volume", "percent"): "مستوى الصوت بالنسبة المئوية (1–150)",
     ("warnings", "member"): "العضو الذي تريد عرض تحذيراته",
+    ("delwarn", "reason"): "سبب إلغاء التحذير (اختياري، يُسجَّل في سجل الإدارة)",
+    ("clearwarns", "reason"): "سبب إلغاء التحذيرات (اختياري، يُسجَّل في سجل الإدارة)",
     ("delwarn", "warn_id"): "رقم التحذير المراد حذفه (يظهر في /warnings)",
     ("clearwarns", "member"): "العضو الذي ستُمسح كل تحذيراته",
     ("unmute", "member"): "العضو الذي سيُفك كتمه",

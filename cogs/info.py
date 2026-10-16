@@ -101,7 +101,7 @@ class Info(commands.Cog):
         m = member or interaction.user
         s = await self.bot.db.get_settings(interaction.guild_id)
         w = await self.bot.db.wallet(interaction.guild_id, m.id)
-        warns = len(await self.bot.db.warnings(interaction.guild_id, m.id))
+        warns = await self.bot.db.active_warning_count(interaction.guild_id, m.id)
         if s["info_cards"] and cards.available() and not m.bot:
             try:
                 if not interaction.response.is_done():
