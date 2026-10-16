@@ -1270,6 +1270,14 @@ async def test_fast_game_and_trigger():
                     m0.reply.await_args_list + m0.channel.send.await_args_list])
             assert await db.balance(GUILD, 22) - before[22] == 20 and await db.balance(GUILD, 21) == before[21], dbg
             assert 5 not in cog.active
+            # جولة ثانية: إجابة خاطئة معروفة (زحل) تُرفض، وإجابة بديلة معتمدة (جوبيتر) بخطأ إملائي بسيط تُقبل
+            sys.modules[type(cog).__module__]._rng = SimpleNamespace(
+                choice=lambda seq: (question, "المشتري|جوبيتر", ["زحل", "الأرض", "نبتون"]), randint=lambda a, b: a)
+            cog.last_game.clear()
+            arr.queue = [(w1, "زحل"), (w1, "الارض"), (w2, "جوبيتير")]
+            b1, b2 = await db.balance(GUILD, 21), await db.balance(GUILD, 22)
+            await cog._run_fast(games_mod.TextInteraction(bot, m0, None), None)
+            assert await db.balance(GUILD, 21) == b1 and await db.balance(GUILD, 22) - b2 == 20
             # لا إجابات: انتهاء بلا جائزة
             arr.queue = []
             await db.set_setting(GUILD, "fast_seconds", 8)

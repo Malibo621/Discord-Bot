@@ -26,7 +26,7 @@ from bot.checks import has_category, require
 from bot.game_data import QUESTIONS, WORDS
 from bot.game_logic import (GuessState, make_math_problem, parse_number, quiz_options, scramble,
                             scramble_hint)
-from bot import registry
+from bot import answers as ans, registry
 from bot.shortcuts import TextInteraction
 from bot.utils import earning_block_reason, has_invisible, normalize, obfuscate
 from bot import gamecards, wheel
@@ -331,13 +331,12 @@ class Games(commands.Cog):
             await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends, image=image),
                                   image=image, alt=f"اكتب الكلمة: {word}")
             started = time.monotonic()
-            target = normalize(word)
             min_time = 0.6 + 0.07 * len(word)  # أسرع من هذا = غير بشري
 
             def check(m: discord.Message):
                 if m.channel.id != interaction.channel_id or m.author.bot:
                     return False
-                if has_invisible(m.content) or normalize(m.content) != target:
+                if has_invisible(m.content) or not ans.same(m.content, word):
                     return False
                 return time.monotonic() - started >= min_time
 
@@ -380,11 +379,10 @@ class Games(commands.Cog):
             await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends, image=image),
                                   image=image, alt="حروف مبعثرة: " + " ".join(mixed))
             started = time.monotonic()
-            target = normalize(word)
 
             def check(m: discord.Message):
                 return (m.channel.id == interaction.channel_id and not m.author.bot
-                        and not has_invisible(m.content) and normalize(m.content) == target)
+                        and not has_invisible(m.content) and ans.same(m.content, word))
 
             msg = await self._wait_message(check, seconds / 2)
             if not msg:  # تلميح في منتصف الوقت (صورة ثابتة جديدة بدل إعادة تشغيل المؤقت)
@@ -542,7 +540,8 @@ class Games(commands.Cog):
         try:
             s = await self.bot.db.get_settings(interaction.guild_id)
             seconds = s["quiz_seconds"]
-            question, answer, wrong = _rng.choice(await self._question_pool(interaction.guild_id))
+            question, raw_answer, wrong = _rng.choice(await self._question_pool(interaction.guild_id))
+            answer = ans.parse_alternatives(raw_answer)[0]
             options = quiz_options(answer, wrong, _rng)
             view = QuizView(options, answer, seconds)
             ends = int(time.time()) + seconds
@@ -572,9 +571,8 @@ class Games(commands.Cog):
     # ================================================================== اسرع (إجابة كتابية)
     @staticmethod
     def answer_key(text: str) -> str:
-        """تطبيع الإجابة للمقارنة: الهمزات/التشكيل/المسافات، وتجاهل «ال» التعريف في أول الكلمة."""
-        t = normalize(text)
-        return t[2:] if t.startswith("ال") and len(t) > 3 else t
+        """مفتاح مقارنة موحّد (للتوافق): تطبيع كامل مع تجاهل «ال» التعريف."""
+        return ans.compact(ans.fold(text, strip_article=True))
 
     @game.command(name="fast", description="تحدي سرعة: سؤال تجيب عليه بالكتابة، وأول إجابة صحيحة تفوز")
     @app_commands.describe(reward="مكافأة مخصصة (لمنظمي الفعاليات)")
@@ -589,7 +587,9 @@ class Games(commands.Cog):
         try:
             s = await self.bot.db.get_settings(interaction.guild_id)
             seconds = s["fast_seconds"]
-            question, answer, _wrong = _rng.choice(await self._question_pool(interaction.guild_id))
+            question, raw_answer, wrong = _rng.choice(await self._question_pool(interaction.guild_id))
+            alternatives = ans.parse_alternatives(raw_answer)
+            answer = alternatives[0]                      # المعروضة عند الكشف
             ends = int(time.time()) + seconds
             ctx.visual = self._visual_ok(interaction, s)
             rl = self._reward_label(ctx, s)
@@ -599,13 +599,12 @@ class Games(commands.Cog):
             await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends, image=image),
                                   image=image, alt=f"سؤال: {question}")
             started = time.monotonic()
-            target = self.answer_key(answer)
             min_time = 0.8 + 0.04 * len(answer)  # أسرع من هذا غير بشري (نسخ/آلي)
 
             def check(m: discord.Message):
                 if m.channel.id != interaction.channel_id or m.author.bot or has_invisible(m.content):
                     return False
-                if self.answer_key(m.content) != target:
+                if not ans.match(m.content, alternatives, wrong, mode="smart").ok:
                     return False
                 return time.monotonic() - started >= min_time
 
@@ -914,11 +913,16 @@ async def add_custom_question(bot, guild_id: int, question: str, answer: str, wr
         return False, "السؤال والإجابات مطلوبة (السؤال من 5 إلى 200 حرف)."
     if any(len(x) > 80 for x in wrong + [answer]):
         return False, "كل إجابة يجب ألا تتجاوز 80 حرفًا."
-    if len({normalize(x) for x in wrong + [answer]}) < 4:
+    primary = ans.parse_alternatives(answer)[0]
+    if len({ans.compact(ans.fold(x)) for x in wrong + [primary]}) < 4:
         return False, "الإجابات الأربع يجب أن تكون مختلفة."
+    if any(ans.match(w, ans.parse_alternatives(answer), (), mode="exact").ok for w in wrong):
+        return False, "إحدى الإجابات الخاطئة تطابق إجابة صحيحة بديلة."
     cid = await bot.db.add_custom(guild_id, "question", question, answer,
                                   json.dumps(wrong, ensure_ascii=False), user_id)
-    return True, f"`#{cid}` {question}\n✅ {answer}"
+    alts = ans.parse_alternatives(answer)
+    extra = f"\n🔁 بدائل معتمدة: {' | '.join(alts[1:])}" if len(alts) > 1 else ""
+    return True, f"`#{cid}` {question}\n✅ {alts[0]}{extra}"
 
 
 async def content_embed(bot, guild_id: int) -> discord.Embed:
