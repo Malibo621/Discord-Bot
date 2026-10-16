@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -96,6 +97,26 @@ CREATE TABLE IF NOT EXISTS custom_content (
     created_by INTEGER,
     created_at INTEGER NOT NULL
 );
+-- إعدادات الأوامر لكل سيرفر: تفعيل/تعطيل منطقي، وصف مخصص، وأوصاف الخيارات (JSON)
+CREATE TABLE IF NOT EXISTS command_config (
+    guild_id INTEGER NOT NULL,
+    command TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    description TEXT,
+    options TEXT,
+    updated_by INTEGER,
+    updated_at INTEGER,
+    PRIMARY KEY (guild_id, command)
+);
+-- اختصارات الأوامر النصية (مثل !ban): الاسم المختصر ← اسم الأمر الكامل
+CREATE TABLE IF NOT EXISTS command_shortcuts (
+    guild_id INTEGER NOT NULL,
+    shortcut TEXT NOT NULL,
+    command TEXT NOT NULL,
+    created_by INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, shortcut)
+);
 -- مفتاح فريد لكل جائزة لعبة: يمنع صرف الجائزة مرتين بسبب الضغط المتكرر أو التفاعلات المتزامنة
 CREATE TABLE IF NOT EXISTS reward_claims (
     claim_key TEXT PRIMARY KEY,
@@ -131,6 +152,8 @@ class Database:
         self.conn: Optional[aiosqlite.Connection] = None
         self._lock = asyncio.Lock()
         self._settings_cache: dict[int, dict[str, Any]] = {}
+        self._cmd_cache: dict[int, dict[str, dict]] = {}
+        self._shortcut_cache: dict[int, dict[str, str]] = {}
 
     async def connect(self) -> None:
         self.conn = await aiosqlite.connect(self.path, isolation_level=None)
@@ -138,6 +161,15 @@ class Database:
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.execute("PRAGMA foreign_keys=ON")
         await self.conn.executescript(SCHEMA)
+        await self._migrate()
+
+    async def _migrate(self) -> None:
+        """يضيف الأعمدة الجديدة لقواعد بيانات قديمة دون المساس بأي بيانات موجودة."""
+        cols = {r["name"] for r in await self.fetchall("PRAGMA table_info(shop_items)")}
+        if "image_url" not in cols:
+            await self.conn.execute("ALTER TABLE shop_items ADD COLUMN image_url TEXT")
+        if "deleted" not in cols:   # حذف «ناعم»: يُخفي المنتج نهائيًا مع بقاء المشتريات والسجلات سليمة
+            await self.conn.execute("ALTER TABLE shop_items ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
 
     async def close(self) -> None:
         if self.conn:
@@ -206,6 +238,68 @@ class Database:
     async def reset_setting(self, guild_id: int, key: str) -> None:
         await self.execute("DELETE FROM settings WHERE guild_id=? AND key=?", (guild_id, key))
         self._settings_cache.pop(guild_id, None)
+
+    # ------------------------------------------------------------------ إعدادات الأوامر والاختصارات
+    async def command_configs(self, guild_id: int) -> dict[str, dict]:
+        """{اسم الأمر: {enabled, description, options}} — مخزّنة مؤقتًا وتُبطل عند أي تعديل."""
+        if guild_id not in self._cmd_cache:
+            rows = await self.fetchall("SELECT * FROM command_config WHERE guild_id=?", (guild_id,))
+            out = {}
+            for r in rows:
+                try:
+                    opts = json.loads(r["options"]) if r["options"] else {}
+                except ValueError:
+                    opts = {}
+                out[r["command"]] = {"enabled": bool(r["enabled"]), "description": r["description"], "options": opts}
+            self._cmd_cache[guild_id] = out
+        return self._cmd_cache[guild_id]
+
+    async def save_command_config(self, guild_id: int, command: str, *, enabled: bool, description: Optional[str],
+                                  options: dict, admin_id: int) -> None:
+        if enabled and not description and not options:  # لا حاجة لصف يساوي الافتراضي
+            await self.execute("DELETE FROM command_config WHERE guild_id=? AND command=?", (guild_id, command))
+        else:
+            await self.execute(
+                "INSERT INTO command_config (guild_id, command, enabled, description, options, updated_by, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(guild_id, command) DO UPDATE SET enabled=excluded.enabled, "
+                "description=excluded.description, options=excluded.options, updated_by=excluded.updated_by, "
+                "updated_at=excluded.updated_at",
+                (guild_id, command, int(enabled), description, json.dumps(options, ensure_ascii=False) if options else None,
+                 admin_id, now()))
+        self._cmd_cache.pop(guild_id, None)
+
+    async def shortcuts(self, guild_id: int) -> dict[str, str]:
+        if guild_id not in self._shortcut_cache:
+            rows = await self.fetchall("SELECT shortcut, command FROM command_shortcuts WHERE guild_id=? ORDER BY shortcut",
+                                       (guild_id,))
+            self._shortcut_cache[guild_id] = {r["shortcut"]: r["command"] for r in rows}
+        return self._shortcut_cache[guild_id]
+
+    async def add_shortcut(self, guild_id: int, shortcut: str, command: str, admin_id: int) -> bool:
+        """يرجع False إن كان الاختصار موجودًا (القيد الفريد يمنع التكرار حتى مع الضغط المتزامن)."""
+        async with self._lock:
+            cur = await self.conn.execute(
+                "INSERT OR IGNORE INTO command_shortcuts (guild_id, shortcut, command, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?)", (guild_id, shortcut, command, admin_id, now()))
+            ok = cur.rowcount > 0
+        self._shortcut_cache.pop(guild_id, None)
+        return ok
+
+    async def delete_shortcut(self, guild_id: int, shortcut: str) -> bool:
+        async with self._lock:
+            cur = await self.conn.execute("DELETE FROM command_shortcuts WHERE guild_id=? AND shortcut=?",
+                                          (guild_id, shortcut))
+            ok = cur.rowcount > 0
+        self._shortcut_cache.pop(guild_id, None)
+        return ok
+
+    async def rename_shortcut(self, guild_id: int, old: str, new: str) -> bool:
+        async with self._lock:
+            cur = await self.conn.execute(
+                "UPDATE OR IGNORE command_shortcuts SET shortcut=? WHERE guild_id=? AND shortcut=?", (new, guild_id, old))
+            ok = cur.rowcount > 0
+        self._shortcut_cache.pop(guild_id, None)
+        return ok
 
     # ------------------------------------------------------------------ الصلاحيات
     async def perm_roles(self, guild_id: int, category: str) -> list[int]:
@@ -408,7 +502,7 @@ class Database:
 
     # ------------------------------------------------------------------ المتجر
     async def shop_items(self, guild_id: int, include_inactive: bool = False):
-        sql = "SELECT * FROM shop_items WHERE guild_id=?"
+        sql = "SELECT * FROM shop_items WHERE guild_id=? AND deleted=0"
         if not include_inactive:
             sql += " AND active=1"
         return await self.fetchall(sql + " ORDER BY price, id", (guild_id,))
@@ -417,15 +511,24 @@ class Database:
         return await self.fetchone("SELECT * FROM shop_items WHERE guild_id=? AND id=?", (guild_id, item_id))
 
     async def add_shop_item(self, guild_id, name, description, price, kind, role_id, stock, duration_hours,
-                            one_per_user) -> int:
+                            one_per_user, image_url: Optional[str] = None) -> int:
         return await self.execute(
             "INSERT INTO shop_items (guild_id, name, description, price, kind, role_id, stock, duration_hours, "
-            "one_per_user, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (guild_id, name, description, price, kind, role_id, stock, duration_hours, int(one_per_user), now()),
+            "one_per_user, created_at, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, name, description, price, kind, role_id, stock, duration_hours, int(one_per_user), now(),
+             image_url or None),
         )
 
+    async def delete_shop_item(self, guild_id: int, item_id: int) -> bool:
+        """حذف ناعم: يختفي من المتجر واللوحة ولا يمكن شراؤه، وتبقى المشتريات السابقة والاستردادات تعمل."""
+        async with self._lock:
+            cur = await self.conn.execute(
+                "UPDATE shop_items SET deleted=1, active=0 WHERE guild_id=? AND id=? AND deleted=0",
+                (guild_id, item_id))
+            return cur.rowcount > 0
+
     async def update_shop_item(self, guild_id: int, item_id: int, **fields) -> None:
-        allowed = {"name", "description", "price", "stock", "duration_hours", "one_per_user", "active"}
+        allowed = {"name", "description", "price", "stock", "duration_hours", "one_per_user", "active", "image_url"}
         fields = {k: v for k, v in fields.items() if k in allowed and v is not None}
         if not fields:
             return

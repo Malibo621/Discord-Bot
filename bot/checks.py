@@ -41,6 +41,7 @@ def require(category: str):
             return True
         raise NoPermission(category)
 
+    predicate.perm_category = category  # تقرأها لوحة الأوامر لعرض الصلاحية المطلوبة
     return app_commands.check(predicate)
 
 
@@ -57,4 +58,5 @@ def admin_only():
             return True
         raise NoPermission("admin")
 
+    predicate.perm_category = "admin"
     return app_commands.check(predicate)

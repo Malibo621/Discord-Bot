@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from bot import ui
+from bot import instance_lock, registry, ui
 from bot.checks import NoPermission
 from bot.db import Database
 from bot.settings_schema import PERMISSION_CATEGORIES
@@ -31,7 +31,23 @@ COGS = [
     "cogs.logging_events",
     "cogs.info",
     "cogs.panel",
+    "cogs.cmd_admin",
+    "cogs.voice_home",
 ]
+
+
+class CommandDisabled(app_commands.CheckFailure):
+    """الأمر معطّل منطقيًا من لوحة /commands لهذا السيرفر."""
+
+
+class GatedTree(app_commands.CommandTree):
+    """شجرة أوامر تفحص حالة التفعيل قبل كل تنفيذ (للأوامر الأصلية والاختصارات النصية معًا)."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        cmd = interaction.command
+        if cmd is not None and await registry.is_disabled(self.client, interaction.guild_id, cmd.qualified_name):
+            raise CommandDisabled(cmd.qualified_name)
+        return True
 
 
 class ServerBot(commands.Bot):
@@ -45,6 +61,7 @@ class ServerBot(commands.Bot):
             intents=intents,
             help_command=None,
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+            tree_cls=GatedTree,
         )
         self.db = Database(os.getenv("DATABASE_PATH", "data/bot.db"))
 
@@ -54,16 +71,42 @@ class ServerBot(commands.Bot):
         for cog in COGS:
             await self.load_extension(cog)
         self.tree.on_error = self.on_app_command_error
+        registry.apply_docs(self.tree)                       # أوصاف واضحة لكل أمر وخيار
         guild_id = os.getenv("GUILD_ID")
+        if guild_id:                                         # أوصاف خصصها المسؤول وحُفظت سابقًا
+            registry.apply_overrides(self.tree, await self.db.command_configs(int(guild_id)))
         if guild_id:
             guild = discord.Object(id=int(guild_id))
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
             log.info("Synced %d commands to guild %s", len(synced), guild_id)
+            await self._remove_stale_global_commands()
         else:
             synced = await self.tree.sync()
             log.info("Synced %d global commands (may take up to an hour to appear)", len(synced))
+            log.info("GUILD_ID is not set: commands are global. Do not later switch to GUILD_ID without cleaning "
+                     "them (the bot does this automatically).")
         self.expire_roles.start()
+
+    async def _remove_stale_global_commands(self) -> None:
+        """سبب ظهور الأوامر مرتين: أوامر عالمية قديمة (من تشغيل سابق بلا GUILD_ID) + نسخة السيرفر الحالية.
+
+        عند استخدام GUILD_ID يكون نطاق التسجيل المقصود هو السيرفر، فتُحذف النسخة العالمية القديمة فقط
+        (لا تُمسّ أوامر السيرفر ولا تعريفات الكود). للإبقاء عليها ضع KEEP_GLOBAL_COMMANDS=1 في .env.
+        """
+        if os.getenv("KEEP_GLOBAL_COMMANDS") == "1":
+            return
+        try:
+            stale = await self.tree.fetch_commands()
+            if not stale:
+                return
+            names = ", ".join(sorted(c.name for c in stale)[:40])
+            log.warning("Found %d stale GLOBAL commands that duplicate the guild commands (%s). Removing them.",
+                        len(stale), names)
+            await self.http.bulk_upsert_global_commands(self.application_id, [])
+            log.info("Stale global commands removed; commands now appear once (guild scope).")
+        except discord.HTTPException:
+            log.exception("Could not check/remove stale global commands")
 
     async def close(self) -> None:
         await self.db.close()
@@ -120,7 +163,9 @@ class ServerBot(commands.Bot):
 
     # ------------------------------------------------------------------ الأخطاء
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, NoPermission):
+        if isinstance(error, CommandDisabled):
+            msg = "هذا الأمر معطّل حاليًا من الإدارة."
+        elif isinstance(error, NoPermission):
             if error.category == "admin":
                 msg = "هذا الأمر للمسؤولين أو أصحاب الصلاحيات المخصصة فقط."
             else:
@@ -150,6 +195,10 @@ async def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token or token.startswith("ضع"):
         sys.exit("ضع توكن البوت في ملف .env (DISCORD_TOKEN=...)")
+    if not instance_lock.acquire(os.path.join(os.path.dirname(os.getenv("DATABASE_PATH", "data/bot.db")) or ".",
+                                              ".bot.lock")):
+        sys.exit("\n[X] The bot is already running (another copy holds the lock). Close it first, "
+                 "or you will get duplicated replies and voice conflicts.\n")
     bot = ServerBot()
     try:
         async with bot:

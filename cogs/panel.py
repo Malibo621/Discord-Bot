@@ -18,7 +18,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import ui
+from bot import images, ui
 from bot.checks import NoPermission, allowed
 from bot.settings_schema import PERMISSION_CATEGORIES, SETTINGS, SETTINGS_BY_KEY, Setting, format_value, parse_value
 from cogs.economy import POINT_ACTIONS, apply_points_change
@@ -49,6 +49,8 @@ _SECTIONS = [
     Section("protection", "الحماية والإدارة", "🛡️", "السبام، الروابط، التخريب، والعقوبات التلقائية", ADMIN,
             ("الحماية", "الإدارة")),
     Section("permissions", "الصلاحيات", "🔐", "ربط فئات الأوامر برتب السيرفر", ADMIN),
+    Section("commands", "الأوامر والاختصارات", "🧩", "استعراض الأوامر وتعطيلها وتعديل أوصافها واختصاراتها النصية",
+            ADMIN, ("الأوامر والاختصارات",)),
 ]
 
 
@@ -97,6 +99,7 @@ class PanelView(ui.BaseView):
         self.page = 0
         self.status: Optional[tuple[bool, str]] = None
         self.confirm_refund: Optional[int] = None
+        self.confirm_delete: Optional[int] = None
         self.last_interaction: Optional[discord.Interaction] = None
 
     # ------------------------------------------------------------------ الأمان
@@ -252,13 +255,26 @@ class PanelView(ui.BaseView):
                 state = "🟢 معروض" if item["active"] else "🙈 مخفي"
                 stock = "غير محدود" if item["stock"] < 0 else f"{item['stock']:,}"
                 kind = f"🎖️ رتبة <@&{item['role_id']}>" if item["kind"] == "role" else "🎁 مكافأة خاصة"
-                e.add_field(name=f"`#{item['id']}` {item['name']}", value=ui.kv([
-                    ("السعر", ui.money(item["price"], s)), ("النوع", kind), ("المخزون", stock), ("الحالة", state),
-                ]) + (f"\n> {item['description']}" if item["description"] else ""), inline=False)
+                rows = [("السعر", ui.money(item["price"], s)), ("النوع", kind), ("المخزون", stock), ("الحالة", state)]
+                if item["kind"] == "role":
+                    h = item["duration_hours"]
+                    rows.append(("المدة", "دائمة" if not h else (f"{h // 24} يوم" if h % 24 == 0 else f"{h} ساعة")))
+                e.add_field(name=f"`#{item['id']}` {item['name']}", value=ui.kv(rows)
+                            + (f"\n> {item['description']}" if item["description"] else ""), inline=False)
+                if item["image_url"]:
+                    e.set_image(url=item["image_url"])
+                confirm = self.confirm_delete == item["id"]
                 self.add_item(ActionButton("edit_item", "تعديل", "✏️", discord.ButtonStyle.primary, row=2))
+                self.add_item(ActionButton("stock_item", "المخزون", "📦", row=2))
                 self.add_item(ActionButton("toggle_item", "إخفاء" if item["active"] else "إظهار",
                                            "🙈" if item["active"] else "👁️", row=2))
-                self.add_item(ActionButton("back", "رجوع", "↩️", row=2))
+                self.add_item(ActionButton("delete_item", "اضغط للتأكيد" if confirm else "حذف",
+                                           "⚠️" if confirm else "🗑️", discord.ButtonStyle.danger, row=3))
+                self.add_item(ActionButton("back", "رجوع", "↩️", row=3))
+                if confirm:
+                    e.add_field(name="⚠️ تأكيد الحذف", value="سيُخفى المنتج نهائيًا من المتجر واللوحة، وتبقى "
+                                                             "المشتريات السابقة والاستردادات محفوظة. اضغط «حذف» مرة ثانية للتأكيد.",
+                                inline=False)
                 return e
             self.mode = None
         if self.mode == "order":
@@ -276,20 +292,30 @@ class PanelView(ui.BaseView):
                 return e
             self.mode = None
 
+        per = 15
+        pages = max(1, (len(items) + per - 1) // per)
+        self.page = max(0, min(self.page, pages - 1))
+        shown = items[self.page * per:(self.page + 1) * per]
         lines = []
-        for i in items[:15]:
+        for i in shown:
             flag = "" if i["active"] else "  🙈"
-            lines.append(f"`#{i['id']}` **{i['name']}** — `{i['price']:,}` {s['currency_emoji']}{flag}")
-        e.add_field(name=f"📦 المنتجات ({len(items)})", value="\n".join(lines) or "*لا توجد منتجات بعد*", inline=False)
+            stock = "" if i["stock"] < 0 else f"  ·  📦 {i['stock']}"
+            img = "  🖼️" if i["image_url"] else ""
+            lines.append(f"`#{i['id']}` **{i['name']}** — `{i['price']:,}` {s['currency_emoji']}{stock}{img}{flag}")
+        e.add_field(name=f"📦 المنتجات ({len(items)})" + (f"  ·  صفحة {self.page + 1}/{pages}" if pages > 1 else ""),
+                    value="\n".join(lines) or "*لا توجد منتجات بعد — ابدأ بزر الإضافة*", inline=False)
         e.add_field(name=f"🟡 طلبات معلّقة ({len(pending)})",
                     value="\n".join(f"`#{p['id']}` <@{p['user_id']}> — {p['item_name']}" for p in pending[:8])
                     or "*لا توجد طلبات*", inline=False)
-        if items:
-            self.add_item(ItemSelect(items[:25], s))
+        if shown:
+            self.add_item(ItemSelect(shown, s))
         if pending:
             self.add_item(OrderSelect(pending[:25]))
-        self.add_item(ActionButton("new_custom", "مكافأة خاصة", "🎁", discord.ButtonStyle.success, row=3))
-        self.add_item(ActionButton("new_role", "منتج رتبة", "🎖️", discord.ButtonStyle.success, row=3))
+        self.add_item(ActionButton("new_custom", "إضافة مكافأة", "🎁", discord.ButtonStyle.success, row=3))
+        self.add_item(ActionButton("new_role", "إضافة رتبة", "🎖️", discord.ButtonStyle.success, row=3))
+        if pages > 1:
+            self.add_item(ActionButton("prev_page", "السابق", "◀️", row=4, disabled=self.page == 0))
+            self.add_item(ActionButton("next_page", "التالي", "▶️", row=4, disabled=self.page >= pages - 1))
         return e
 
     async def _permissions(self) -> discord.Embed:
@@ -332,7 +358,7 @@ class PanelView(ui.BaseView):
     async def on_action(self, interaction: discord.Interaction, action: str):
         db = self.bot.db
         if action == "back":
-            self.mode, self.target, self.confirm_refund = None, None, None
+            self.mode, self.target, self.confirm_refund, self.confirm_delete = None, None, None, None
             return await self.refresh(interaction)
         if action in ("prev_page", "next_page"):
             self.page += -1 if action == "prev_page" else 1
@@ -370,12 +396,32 @@ class PanelView(ui.BaseView):
             return await self.refresh(interaction)
         if action == "edit_item":
             item = await db.shop_item(self.guild_id, self.target)
-            if not item:
+            if not item or item["deleted"]:
                 return await self.refresh(interaction, (False, "المنتج غير موجود."))
             return await interaction.response.send_modal(ItemModal(self, kind=item["kind"], item=item))
+        if action == "stock_item":
+            item = await db.shop_item(self.guild_id, self.target)
+            if not item or item["deleted"]:
+                return await self.refresh(interaction, (False, "المنتج غير موجود."))
+            return await interaction.response.send_modal(StockModal(self, item))
+        if action == "delete_item":
+            item = await db.shop_item(self.guild_id, self.target)
+            if not item or item["deleted"]:
+                self.mode = None
+                return await self.refresh(interaction, (False, "المنتج غير موجود أو حُذف بالفعل."))
+            if self.confirm_delete != item["id"]:        # ضغطة تأكيد ثانية قبل الحذف
+                self.confirm_delete = item["id"]
+                return await self.refresh(interaction)
+            self.confirm_delete = None
+            await db.delete_shop_item(self.guild_id, item["id"])
+            await self.bot.send_log(interaction.guild, "economy", ui.info(
+                "🗑️ حذف منتج", f"{interaction.user.mention} حذف `#{item['id']}` **{item['name']}**", ui.Colors.MOD))
+            self.mode, self.target = None, None
+            return await self.refresh(interaction, (True, f"حُذف **{item['name']}** من المتجر. "
+                                                          "المشتريات السابقة محفوظة ولم تُحذف بيانات أحد."))
         if action == "toggle_item":
             item = await db.shop_item(self.guild_id, self.target)
-            if not item:
+            if not item or item["deleted"]:
                 return await self.refresh(interaction, (False, "المنتج غير موجود."))
             await db.update_shop_item(self.guild_id, item["id"], active=0 if item["active"] else 1)
             state = "مخفي الآن" if item["active"] else "معروض الآن"
@@ -412,6 +458,11 @@ class SectionSelect(discord.ui.Select):
         sec = SECTIONS_BY_KEY.get(value)
         if sec is None or not await view.guard(interaction, sec.perm):
             return
+        if sec.key == "commands":  # لوحة مستقلة بواجهتها (نفس الصلاحية والقفل)، وفيها زر للعودة هنا
+            from cogs.cmd_admin import CommandsView
+            cv = CommandsView(view.bot, interaction.user, interaction.guild)
+            view.stop()
+            return await interaction.response.edit_message(embed=await cv.build(), view=cv)
         view.section = sec
         await view.refresh(interaction)
 
@@ -442,8 +493,10 @@ class SettingSelect(discord.ui.Select):
 
 class ChannelPicker(discord.ui.ChannelSelect):
     def __init__(self, st: Setting):
-        super().__init__(placeholder=f"#️⃣ {st.label}"[:100], row=1,
-                         channel_types=[discord.ChannelType.text, discord.ChannelType.news])
+        voice = st.key == "voice_home_channel"
+        types = ([discord.ChannelType.voice, discord.ChannelType.stage_voice] if voice
+                 else [discord.ChannelType.text, discord.ChannelType.news])
+        super().__init__(placeholder=f"#️⃣ {st.label}"[:100], row=1, channel_types=types)
         self.st = st
 
     async def callback(self, interaction: discord.Interaction):
@@ -454,7 +507,11 @@ class ChannelPicker(discord.ui.ChannelSelect):
         if channel is None:
             return await view.refresh(interaction, (False, "الروم غير موجود في هذا السيرفر."))
         perms = channel.permissions_for(interaction.guild.me)
-        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        if self.st.key == "voice_home_channel":
+            if not (perms.view_channel and perms.connect and perms.speak):
+                return await view.refresh(interaction, (False, f"لا أستطيع الاتصال والتحدث في {channel.mention}. "
+                                                               "امنحني صلاحيات العرض والاتصال والتحدث."))
+        elif not (perms.view_channel and perms.send_messages and perms.embed_links):
             return await view.refresh(interaction, (False, f"لا أستطيع الإرسال في {channel.mention}. "
                                                            "امنحني صلاحيات العرض والإرسال والتضمين."))
         await view.save_setting(interaction, self.st, channel.id)
@@ -537,7 +594,7 @@ class ItemSelect(discord.ui.Select):
         view: PanelView = self.view
         if not await view.guard(interaction, "shop"):
             return
-        view.mode, view.target = "item", int(self.values[0])
+        view.mode, view.target, view.confirm_delete = "item", int(self.values[0]), None
         await view.refresh(interaction)
 
 
@@ -675,20 +732,25 @@ class ItemModal(PanelModal):
         self.kind, self.role, self.item = kind, role, item
         self.name = discord.ui.TextInput(label="اسم المنتج", max_length=60,
                                          default=item["name"] if item else (role.name if role else None))
-        self.price = discord.ui.TextInput(label="السعر", max_length=12, placeholder="مثال: 2000",
+        self.price = discord.ui.TextInput(label="السعر بالنقاط", max_length=12, placeholder="مثال: 2000",
                                           default=str(item["price"]) if item else None)
         self.desc = discord.ui.TextInput(label="الوصف (اختياري)", required=False, max_length=300,
                                          style=discord.TextStyle.paragraph,
                                          default=(item["description"] or "") if item else None)
-        self.stock = discord.ui.TextInput(label="الكمية (-1 = غير محدود)", required=False, max_length=8,
-                                          default=str(item["stock"]) if item else "-1")
-        for x in (self.name, self.price, self.desc, self.stock):
+        self.image = discord.ui.TextInput(label="رابط صورة المنتج (اختياري، https)", required=False, max_length=400,
+                                          placeholder="https://.../image.png",
+                                          default=(item["image_url"] or "") if item else None)
+        for x in (self.name, self.price, self.desc, self.image):
             self.add_item(x)
-        self.hours = None
-        if kind == "role":
+        self.stock = self.hours = None
+        if kind == "role":   # المخزون للرتب يُعدَّل من زر «المخزون»
             self.hours = discord.ui.TextInput(label="مدة الرتبة بالساعات (0 = دائمة)", required=False, max_length=6,
                                               default=str(item["duration_hours"]) if item else "0")
             self.add_item(self.hours)
+        else:
+            self.stock = discord.ui.TextInput(label="الكمية (-1 = غير محدودة)", required=False, max_length=8,
+                                              default=str(item["stock"]) if item else "-1")
+            self.add_item(self.stock)
 
     async def apply(self, interaction):
         db, gid = self.panel.bot.db, self.panel.guild_id
@@ -696,24 +758,52 @@ class ItemModal(PanelModal):
         if not name:
             raise ValueError("اسم المنتج مطلوب.")
         price = _int(self.price.value, "السعر", 0, 1_000_000_000)
-        stock = _int(self.stock.value or "-1", "الكمية", -1, 1_000_000)
-        hours = _int(self.hours.value or "0", "المدة", 0, 87600) if self.hours else 0
-        desc = self.desc.value.strip() or None
+        stock = _int(self.stock.value or "-1", "الكمية", -1, 1_000_000) if self.stock else None
+        hours = _int(self.hours.value or "0", "المدة", 0, 87600) if self.hours else None
+        image = images.validate_url(self.image.value)        # يرفع ValueError برسالة واضحة
+        desc = self.desc.value.strip()
         if self.item:
             await db.update_shop_item(gid, self.item["id"], name=name, price=price, description=desc, stock=stock,
-                                      duration_hours=hours if self.kind == "role" else None)
+                                      duration_hours=hours, image_url=image)
             self.panel.mode = "item"
+            await self.panel.bot.send_log(interaction.guild, "economy", ui.info(
+                "✏️ تعديل منتج", f"{interaction.user.mention} عدّل `#{self.item['id']}` **{name}** (السعر `{price:,}`)",
+                ui.Colors.LOG))
             return True, f"تم تعديل **{name}**."
         if self.role:  # إعادة الفحص عند الحفظ: ربما تغيّرت رتبة البوت أو صلاحيات الرتبة
             problem = role_sale_error(self.role, interaction.guild)
             if problem:
                 raise ValueError(problem)
-        item_id = await db.add_shop_item(gid, name, desc, price, self.kind, self.role.id if self.role else None,
-                                         stock, hours, True)
+        item_id = await db.add_shop_item(gid, name, desc or None, price, self.kind,
+                                         self.role.id if self.role else None, stock if stock is not None else -1,
+                                         hours or 0, True, image_url=image or None)
         self.panel.mode, self.panel.target = "item", item_id
         await self.panel.bot.send_log(interaction.guild, "economy", ui.info(
             "🛒 منتج جديد", f"{interaction.user.mention} أضاف `#{item_id}` **{name}** بسعر `{price:,}`", ui.Colors.LOG))
         return True, f"أُضيف المنتج `#{item_id}` **{name}** إلى المتجر."
+
+
+class StockModal(PanelModal):
+    perm = "shop"
+
+    def __init__(self, view: PanelView, item):
+        super().__init__(view, f"مخزون {item['name']}"[:45])
+        self.item = item
+        self.stock = discord.ui.TextInput(label="الكمية المتاحة (-1 = غير محدودة)", max_length=8,
+                                          default=str(item["stock"]))
+        self.add_item(self.stock)
+
+    async def apply(self, interaction):
+        n = _int(self.stock.value, "الكمية", -1, 1_000_000)
+        db, gid = self.panel.bot.db, self.panel.guild_id
+        if not await db.shop_item(gid, self.item["id"]):
+            raise ValueError("المنتج غير موجود.")
+        await db.update_shop_item(gid, self.item["id"], stock=n)
+        self.panel.mode = "item"
+        await self.panel.bot.send_log(interaction.guild, "economy", ui.info(
+            "📦 تعديل مخزون", f"{interaction.user.mention} ضبط مخزون `#{self.item['id']}` **{self.item['name']}** "
+                              f"إلى {'غير محدود' if n < 0 else n}", ui.Colors.LOG))
+        return True, f"المخزون الآن: **{'غير محدود' if n < 0 else f'{n:,}'}**."
 
 
 def _int(raw: str, label: str, lo: int, hi: int) -> int:

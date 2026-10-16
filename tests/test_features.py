@@ -15,7 +15,7 @@ import discord  # noqa: E402
 
 from bot import wheel  # noqa: E402
 from bot.checks import allowed, has_category, is_admin  # noqa: E402
-from bot.db import Database  # noqa: E402
+from bot.db import Database, LimitReached  # noqa: E402
 from bot.game_logic import GuessState, make_math_problem, parse_number, quiz_options, scramble  # noqa: E402
 from bot.settings_schema import SETTINGS, SETTINGS_BY_KEY, parse_value  # noqa: E402
 from cogs import panel as panel_mod  # noqa: E402
@@ -48,6 +48,7 @@ def fake_interaction(user, guild_id=GUILD):
     i.response.is_done = MagicMock(return_value=False)
     i.response.send_message = AsyncMock()
     i.response.edit_message = AsyncMock()
+    i.response.defer = AsyncMock(side_effect=lambda *a, **k: setattr(i.response, "is_done", MagicMock(return_value=True)))
     i.response.send_modal = AsyncMock()
     i.edit_original_response = AsyncMock()
     return i
@@ -390,9 +391,1135 @@ async def test_other_game_flows():
             await db.close()
 
 
+def test_gamecards():
+    from PIL import Image
+    from bot import gamecards as gc
+    assert gc.available()
+    import io as _io
+
+    def check(res, expect_gif=None):
+        data, ext = res
+        im = Image.open(_io.BytesIO(data))
+        assert im.size == (gc.W, gc.H) and ext in ("png", "gif")
+        assert len(data) < 2 * 1024 * 1024, len(data)
+        if expect_gif is not None:
+            assert (ext == "gif") == expect_gif and (im.n_frames > 1) == expect_gif
+        return im
+
+    # الحساب: كل العمليات + مسائل طويلة، متحرك وثابت
+    for expr in ("200 + 200", "384 − 127", "15 × 14", "168 ÷ 12", "999 + 999"):
+        check(gc.render_math(expr, 15, "15 نقطة", "سهل"), True)
+        check(gc.render_math(expr, 15, None, "", animate=False), False)
+    # المؤقت GIF: ينتهي بإطار فارغ طويل المدة، وعدد الإطارات محدود حتى للمدد الطويلة
+    im = check(gc.render_math("1 + 1", 120, "5 نقطة"), True)
+    assert im.n_frames <= gc.MAX_GIF_FRAMES + 1
+    im.seek(im.n_frames - 1)
+    assert im.info["duration"] >= 60_000
+    # مدة قصيرة جدًا لا تنهار
+    check(gc.render_math("1 + 1", 2, "5"), False)
+    # الكتابة والتفكيك: كلمات عربية/لاتينية/طويلة
+    for w in ("مستشفى", "Keyboard", "x" * 40, "أبجد هوز"):
+        check(gc.render_typing(w, 20, "15 نقطة"), True)
+    for letters in (list("ىفشتسم"), list("abcd"), list("ابتثجحخدذرزسشصضطظعغفقكلمنهوي")[:12]):
+        check(gc.render_scramble(letters, 30, "20 نقطة", hint="تبدأ بـ «م» • عدد الحروف 6"), True)
+        check(gc.render_scramble(letters, 30, None, animate=False), False)
+    # الأسئلة: سؤال طويل جدًا وخيارات طويلة وأقل من 4 خيارات
+    long_q = "ما هو اسم " + "العالم الذي اكتشف " * 12 + "؟"
+    check(gc.render_quiz(long_q, ["إجابة طويلة جدًا " * 6, "ب", "ج", "د"], 20, "20 نقطة"), True)
+    check(gc.render_quiz("سؤال", ["أ", "ب"], 20, None), True)
+    # التخمين: أول النطاق وآخره وبعد التضييق
+    check(gc.render_guess(1, 1000, 1000, 0, 5, "25 نقطة"), False)
+    check(gc.render_guess(500, 500, 1000, 40, 5, None, last="آخر تخمين: 499 ← الرقم أكبر"), False)
+    # النتيجة: فائز باسم طويل/إيموجي/أفاتار تالف/بدون تفاصيل، وانتهاء الوقت
+    for headline in ("سارة", "x" * 80, "🔥🔥", ""):
+        check(gc.render_result("math", headline, [("الوقت", "2.41 ث"), ("الناتج", "400")], winner=True,
+                               avatar=b"not an image"), True)
+    check(gc.render_result("quiz", "الرياض", [], winner=True, animate=False), False)
+    check(gc.render_result("typing", "كلمة", [("الكلمة", "كلمة")], winner=False), False)
+    # صورة أفاتار حقيقية صغيرة
+    buf = _io.BytesIO()
+    Image.new("RGB", (64, 64), (200, 30, 90)).save(buf, "PNG")
+    check(gc.render_result("guess", "نور", [("الرقم", "42")], winner=True, avatar=buf.getvalue()), True)
+    print("OK gamecards: all 5 games + result screens, GIF timer, long/odd text, bad avatar, frame cap")
+
+
+async def test_visual_fallback():
+    """عند تعطيل البطاقات أو غياب صلاحية رفع الملفات تعمل اللعبة بالنص ولا تتعطل."""
+    import datetime
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = fake_bot(db)
+            cog = Games(bot)
+            s = await db.get_settings(GUILD)
+            inter = fake_interaction(fake_member(1, admin=True))
+            inter.app_permissions = discord.Permissions(attach_files=True, embed_links=True)
+            assert cog._visual_ok(inter, s)
+            inter.app_permissions = discord.Permissions(attach_files=False, embed_links=True)
+            assert not cog._visual_ok(inter, s)
+            inter.app_permissions = discord.Permissions(attach_files=True, embed_links=True)
+            await db.set_setting(GUILD, "game_visuals", False)
+            assert not cog._visual_ok(inter, await db.get_settings(GUILD))
+            await db.set_setting(GUILD, "game_visuals", True)
+
+            # فشل الرسم => رجوع للنص بدون استثناء
+            from cogs.games import GameContext
+            ctx = GameContext(game="math", reward=5, is_event=False, starter=fake_member(1), channel_id=5, visual=True)
+
+            def boom(*_a, **_k):
+                raise RuntimeError("render failed")
+
+            assert await cog._render(ctx, boom) is None and ctx.visual is False
+            assert await cog._result_image(ctx, s, "x", []) is None
+            for key in ("game_visuals", "game_animations"):
+                assert key in SETTINGS_BY_KEY and SETTINGS_BY_KEY[key].kind == "bool"
+        finally:
+            await db.close()
+    print("OK visual fallback: setting off, missing Attach Files, render failure -> text mode")
+
+
+# ====================================================================== الأوامر والاختصارات
+UID = 111111111111111111   # آيديات بطول ديسكورد الحقيقي (المحلل يشترط 15+ رقمًا)
+
+
+async def make_bot(db):
+    import main
+    from bot import registry
+    bot = main.ServerBot()
+    bot.db = db
+    for c in main.COGS:
+        await bot.load_extension(c)
+    bot.get_cog("VoiceHome").watchdog.cancel()   # لا اتصال حقيقي في الاختبارات
+    registry.apply_docs(bot.tree)
+    return bot
+
+
+def fake_message(content, author, members=None, guild_id=GUILD):
+    members = members or {}
+    guild = MagicMock()
+    guild.id = guild_id
+    guild.owner_id = OWNER
+    guild.get_member = lambda uid: members.get(uid)
+    def _fetch(uid):
+        if uid in members:
+            return members[uid]
+        raise discord.NotFound(MagicMock(status=404, reason="Not Found"), "Unknown Member")
+
+    guild.fetch_member = AsyncMock(side_effect=_fetch)
+    guild.me = MagicMock()
+    msg = MagicMock(spec=discord.Message)
+    msg.content, msg.author, msg.guild = content, author, guild
+    msg.created_at = discord.utils.utcnow()
+    msg.id = 1
+    msg.channel = MagicMock()
+    msg.channel.id = 5
+    msg.channel.permissions_for = lambda _m: discord.Permissions.all()
+    msg.channel.send = AsyncMock(return_value=MagicMock(edit=AsyncMock()))
+    msg.reply = AsyncMock(return_value=MagicMock(edit=AsyncMock()))
+    return msg
+
+
+def last_embed(msg):
+    for call in (msg.reply.await_args_list + msg.channel.send.await_args_list)[::-1]:
+        if call.kwargs.get("embed") is not None:
+            return call.kwargs["embed"]
+    return None
+
+
+async def test_registry_and_storage():
+    from bot import registry, shortcuts as sc
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            leaves = registry.leaves(bot.tree)
+            # كل أمر وخيار له وصف واضح ضمن حد ديسكورد
+            for c in leaves:
+                assert 1 <= len(str(c.description)) <= 100, c.qualified_name
+                for p in c.parameters:
+                    assert str(p.description) not in ("", "…") and len(str(p.description)) <= 100, (c.qualified_name, p.name)
+            # التصنيف والصلاحيات المقروءة من الفحوص الفعلية
+            ban, typing_, settings_, roulette = (registry.find(bot.tree, n) for n in ("ban", "game typing", "settings set", "game roulette"))
+            assert registry.required_perm(ban) == "moderation" and registry.kind_of(ban) == "admin"
+            assert registry.required_perm(settings_) == "admin"
+            assert registry.required_perm(typing_) is None and registry.kind_of(typing_) == "games"
+            assert registry.required_perm(registry.find(bot.tree, "game stop")) == "events"
+            assert registry.required_perm(registry.find(bot.tree, "ping")) is None
+            assert registry.perm_label(typing_) == "الجميع" and "الإدارة" in registry.perm_label(ban)
+            assert [p.name for p in roulette.parameters] == ["mode", "join_seconds", "reward"]
+            # أي أمر غير مسموح له باختصار (إدارة البوت/الموسيقى)
+            for q in ("panel", "commands", "settings set", "permissions add", "music play"):
+                assert not registry.shortcut_support(registry.find(bot.tree, q))[0], q
+            assert registry.shortcut_support(ban)[0] and registry.shortcut_support(roulette)[0]
+            # الوصف الأصلي محفوظ للاستعادة
+            assert "روليت" in registry.default_description("game roulette")
+
+            # تخصيص الوصف يُحفظ ويُطبَّق ثم يعود للأصلي عند الاستعادة
+            await db.save_command_config(GUILD, "ping", enabled=True, description="وصف مخصص", options={}, admin_id=1)
+            registry.apply_overrides(bot.tree, await db.command_configs(GUILD))
+            assert str(registry.find(bot.tree, "ping").description) == "وصف مخصص"
+            await db.save_command_config(GUILD, "avatar", enabled=True, description=None,
+                                         options={"member": "صاحب الصورة"}, admin_id=1)
+            registry.apply_overrides(bot.tree, await db.command_configs(GUILD))
+            assert str(registry.find(bot.tree, "avatar").parameters[0].description) == "صاحب الصورة"
+            await db.save_command_config(GUILD, "ping", enabled=True, description=None, options={}, admin_id=1)
+            await db.save_command_config(GUILD, "avatar", enabled=True, description=None, options={}, admin_id=1)
+            registry.apply_overrides(bot.tree, await db.command_configs(GUILD))
+            assert str(registry.find(bot.tree, "ping").description) == registry.default_description("ping")
+            assert (await db.command_configs(GUILD)) == {}          # الإعداد الافتراضي لا يترك صفوفًا
+            for bad in ("", "x" * 101, "bad\x00"):
+                try:
+                    registry.validate_description(bad)
+                    raise AssertionError(bad)
+                except ValueError:
+                    pass
+
+            # حالة التفعيل والبوابة
+            await db.save_command_config(GUILD, "kick", enabled=False, description=None, options={}, admin_id=1)
+            assert await registry.is_disabled(bot, GUILD, "kick") and not await registry.is_disabled(bot, 2, "kick")
+            await db.save_command_config(GUILD, "panel", enabled=False, description=None, options={}, admin_id=1)
+            assert not await registry.is_disabled(bot, GUILD, "panel")          # الأوامر المحمية لا تُعطَّل أبدًا
+            import main
+            fake = SimpleNamespace(command=registry.find(bot.tree, "kick"), guild_id=GUILD)
+            try:
+                await bot.tree.interaction_check(fake)
+                raise AssertionError("disabled command passed the gate")
+            except main.CommandDisabled:
+                pass
+            fake.guild_id = 2
+            assert await bot.tree.interaction_check(fake)                        # سيرفر آخر غير متأثر
+
+            # الاختصارات: تفرّد، إعادة تسمية، حذف
+            assert await db.add_shortcut(GUILD, "bn", "ban", 1) is True
+            assert await db.add_shortcut(GUILD, "bn", "kick", 1) is False
+            res = await asyncio.gather(*[db.add_shortcut(GUILD, "same", "ban", 1) for _ in range(10)])
+            assert sum(res) == 1
+            assert await db.rename_shortcut(GUILD, "bn", "b2") and not await db.rename_shortcut(GUILD, "nope", "x")
+            assert not await db.rename_shortcut(GUILD, "b2", "same")             # الاسم المستخدم يمنع إعادة التسمية
+            assert (await db.shortcuts(GUILD)) == {"b2": "ban", "same": "ban"}
+            assert (await db.shortcuts(2)) == {}                                 # لا تسرب بين السيرفرات
+            assert await db.delete_shortcut(GUILD, "same") and not await db.delete_shortcut(GUILD, "same")
+
+            # قواعد التحقق من اسم الاختصار
+            tree, table = bot.tree, await db.shortcuts(GUILD)
+            for good in ("ban", "حظر", "b_3", "!ban"):
+                assert sc.validate_shortcut(tree, table, good, ban) in ("ban", "حظر", "b_3")
+            for bad, target in (("Bad Name", ban), ("", ban), ("x" * 21, ban), ("b2", ban),   # صيغة/تكرار
+                                ("kick", ban), ("ping", ban), ("game-math", ban),            # يطابق اسم أمر آخر
+                                ("zz", registry.find(tree, "panel"))):                       # أمر غير مسموح
+                try:
+                    sc.validate_shortcut(tree, table, bad, target)
+                    raise AssertionError(bad)
+                except ValueError:
+                    pass
+            assert sc.validate_shortcut(tree, table, "b2", ban, replacing="b2") == "b2"
+            # إعدادات البادئة
+            from bot.settings_schema import parse_value, SETTINGS_BY_KEY
+            for good in ("!", ".", "$$", "؟"):
+                assert parse_value(SETTINGS_BY_KEY["shortcut_prefix"], good) == good
+            for bad in ("", "ab", "/", "@", "a!", "!!!!", " ", "<"):
+                try:
+                    parse_value(SETTINGS_BY_KEY["shortcut_prefix"], bad)
+                    raise AssertionError(bad)
+                except ValueError:
+                    pass
+            # بقاء كل شيء بعد إعادة التشغيل
+            await db.close()
+            db2 = await temp_db(d)
+            assert (await db2.command_configs(GUILD))["kick"]["enabled"] is False
+            assert (await db2.shortcuts(GUILD)) == {"b2": "ban"}
+            await db2.close()
+        finally:
+            if db.conn:
+                await db.close()
+    print("OK commands registry: descriptions, perms read from real checks, overrides/reset, gate, "
+          "shortcut rules, uniqueness under concurrency, persistence")
+
+
+async def test_shortcut_parsing_and_execution():
+    from bot import registry, shortcuts as sc
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            tree = bot.tree
+            target_member = fake_member(UID + 1)
+            members = {UID + 1: target_member}
+            ban, mute, clear_, roulette, bal = (registry.find(tree, n) for n in ("ban", "mute", "clear", "game roulette", "balance"))
+            msg = fake_message("", fake_member(1, admin=True), members)
+
+            # --- المحلل
+            assert [t for t, _ in sc.tokenize('a "b c" d')] == ["a", "b c", "d"]
+            kw = await sc.parse_arguments(bot, msg, ban, f"<@{UID + 1}> 3 spam and more words")
+            assert kw["user"] is target_member and kw["delete_days"] == 3 and kw["reason"] == "spam and more words"
+            kw = await sc.parse_arguments(bot, msg, ban, f"<@{UID + 1}> spam reason")      # يتخطى delete_days
+            assert kw == {"user": target_member, "reason": "spam reason"}, kw
+            kw = await sc.parse_arguments(bot, msg, ban, f"{UID + 1}")
+            assert kw == {"user": target_member}                                       # الباقي يأخذ الافتراضي
+            kw = await sc.parse_arguments(bot, msg, clear_, "٢٥")
+            assert kw == {"amount": 25}                                               # أرقام عربية
+            kw = await sc.parse_arguments(bot, msg, roulette, "إقصاء 30")
+            assert kw == {"mode": "إقصاء", "join_seconds": 30}
+            for text, cmd_ in (("", ban), (f"<@{UID + 1}> 9", ban), (f"<@{UID + 1}>", mute), ("abc", clear_),
+                               ("0", clear_), ("999", clear_), ("خيار_خاطئ", roulette), ("إقصاء 5", roulette),
+                               ("<@999999999999999999>", registry.find(tree, "kick")), ("1 2 3", registry.find(tree, "ping"))):
+                try:
+                    await sc.parse_arguments(bot, msg, cmd_, text)
+                    raise AssertionError((text, cmd_.qualified_name))
+                except sc.ShortcutError:
+                    pass
+            assert "<member>" in sc.usage(registry.find(tree, "kick"), "!", "k") or "member" in sc.usage(registry.find(tree, "kick"), "!", "k")
+
+            # --- اكتشاف الرسالة (لا أوامر بالخطأ من الكلام العادي)
+            await db.add_shortcut(GUILD, "bn", "ban", 1)
+            await db.add_shortcut(GUILD, "p", "ping", 1)
+            await db.add_shortcut(GUILD, "رصيد", "balance", 1)
+            normal = fake_member(2)
+            for text in ("bn @x", "hello !bn", "!unknown", "!", "!!bn", "", "ban"):
+                assert await sc.find_target(bot, fake_message(text, normal, members)) is None, text
+            found = await sc.find_target(bot, fake_message("!BN <@1> سبب طويل", normal, members))
+            assert found and found[0] == "bn" and found[1].qualified_name == "ban" and found[2] == "<@1> سبب طويل"
+            assert (await sc.find_target(bot, fake_message("!رصيد", normal, members)))[1].qualified_name == "balance"
+            bot_msg = fake_message("!p", fake_member(77, bot=True), members)
+            assert await sc.find_target(bot, bot_msg) is None
+            dm = fake_message("!p", normal, members)
+            dm.guild = None
+            assert await sc.find_target(bot, dm) is None
+            await db.set_setting(GUILD, "shortcut_prefix", ".")
+            assert await sc.find_target(bot, fake_message("!p", normal, members)) is None
+            assert (await sc.find_target(bot, fake_message(".p", normal, members)))[0] == "p"
+            await db.set_setting(GUILD, "shortcuts_enabled", False)
+            assert await sc.find_target(bot, fake_message(".p", normal, members)) is None
+            await db.reset_setting(GUILD, "shortcuts_enabled")
+            await db.reset_setting(GUILD, "shortcut_prefix")
+
+            # --- تنفيذ فعلي: أمر عام يعمل
+            m = fake_message("!p", normal, members)
+            await sc.run(bot, m, "p", registry.find(tree, "ping"), "", "!")
+            emb = last_embed(m)
+            assert emb is not None and "Pong" in emb.title
+
+            # --- أمر إداري: المستخدم العادي ممنوع والأمر الأصلي لا يُنفَّذ إطلاقًا
+            calls = []
+
+            async def recorder(binding, interaction, **kw):
+                calls.append((interaction.user.id, kw))
+
+            ban._callback = recorder
+            m = fake_message(f"!bn <@{UID + 1}> test", normal, members)
+            await sc.run(bot, m, "bn", ban, f"<@{UID + 1}> test", "!")
+            assert not calls and "صلاحية" in last_embed(m).description
+            # صاحب رتبة الإدارة المخصصة يمرّ، والعضو بصلاحية ديسكورد العامة فقط (بعد تحديد رتب) لا يمرّ
+            await db.set_perm_roles(GUILD, "moderation", [700])
+            mod = fake_member(3, role_ids=(700,))
+            m = fake_message(f"!bn <@{UID + 1}> test", mod, members)
+            await sc.run(bot, m, "bn", ban, f"<@{UID + 1}> test", "!")
+            assert calls == [(3, {"user": target_member, "reason": "test"})], (calls, last_embed(m) and last_embed(m).to_dict())
+            calls.clear()
+            perm_only = fake_member(4, moderate_members=True)
+            m = fake_message(f"!bn <@{UID + 1}>", perm_only, members)
+            await sc.run(bot, m, "bn", ban, f"<@{UID + 1}>", "!")
+            assert not calls
+            # البوت لا يملك الصلاحية المطلوبة (فحص bot_has_permissions الأصلي)
+            m = fake_message(f"!bn <@{UID + 1}>", mod, members)
+            m.channel.permissions_for = lambda _m: discord.Permissions.none()
+            await sc.run(bot, m, "bn", ban, f"<@{UID + 1}>", "!")
+            assert not calls and last_embed(m) is not None
+            # أمر معطّل لا يعمل عبر الاختصار أيضًا (حتى للمسؤول)
+            await db.save_command_config(GUILD, "ban", enabled=False, description=None, options={}, admin_id=1)
+            m = fake_message(f"!bn <@{UID + 1}>", fake_member(1, admin=True), members)
+            await sc.run(bot, m, "bn", ban, f"<@{UID + 1}>", "!")
+            assert not calls and "معطّل" in last_embed(m).description
+            await db.save_command_config(GUILD, "ban", enabled=True, description=None, options={}, admin_id=1)
+            # خطأ مدخلات: رسالة توضح الاستخدام ولا ينفذ شيء
+            m = fake_message("!bn", mod, members)
+            await sc.run(bot, m, "bn", ban, "", "!")
+            assert not calls and "طريقة الاستخدام" in last_embed(m).description
+            # استثناء داخل الأمر لا يكسر البوت ويرد برسالة
+            async def exploding(binding, interaction, **kw):
+                raise RuntimeError("boom")
+
+            ban._callback = exploding
+            m = fake_message(f"!bn <@{UID + 1}>", mod, members)
+            await sc.run(bot, m, "bn", ban, f"<@{UID + 1}>", "!")
+            assert "خطأ غير متوقع" in last_embed(m).description
+
+            # --- أمر حقيقي بالكامل: الرصيد يقرأ قاعدة البيانات عبر الاختصار
+            await db.admin_adjust(GUILD, UID + 1, 250, 1, "t")
+            await db.set_setting(GUILD, "info_cards", False)       # هنا نختبر منطق الاختصار؛ البطاقات لها اختبارها
+            m = fake_message(f"!رصيد <@{UID + 1}>", normal, members)
+            target_member.display_avatar = SimpleNamespace(url="https://example.com/a.png")
+            target_member.display_name = "target"
+            await sc.run(bot, m, "رصيد", bal, f"<@{UID + 1}>", "!")
+            emb = last_embed(m)
+            assert emb is not None and any("250" in str(f.value) for f in emb.fields), emb and emb.to_dict()
+        finally:
+            await db.close()
+    print("OK shortcuts: parsing, prefix safety, same checks as slash (normal/role/perm-only/bot perms/disabled), "
+          "usage errors, crash isolation, real command via shortcut")
+
+
+async def test_commands_panel():
+    from bot import registry
+    from cogs import cmd_admin as ca
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            admin, normal = fake_member(1, admin=True), fake_member(2)
+            view = ca.CommandsView(bot, admin, MagicMock(id=GUILD))
+
+            # كل الأوضاع تُبنى ضمن حدود ديسكورد (صفوف، عناصر، طول الرسالة)
+            async def check_layout():
+                e = await view.build()
+                assert len(view.children) <= 25 and len(e) <= 6000 and len(e.fields) <= 25
+                rows = {}
+                for ch in view.children:
+                    rows[ch.row] = rows.get(ch.row, 0) + (5 if isinstance(ch, discord.ui.Select) else 1)
+                assert all(v <= 5 for v in rows.values()), rows
+                for ch in view.children:
+                    if isinstance(ch, discord.ui.Select):
+                        assert 1 <= len(ch.options) <= 25
+                return e
+
+            await db.add_shortcut(GUILD, "bn", "ban", 1)
+            for kind in ("all", "general", "games", "admin"):
+                view.kind, view.mode, view.page = kind, "list", 0
+                await check_layout()
+            view.query = "ban"
+            e = await check_layout()
+            assert "/ban" in e.description
+            view.query, view.kind = "", "all"
+            view.page = 99                       # صفحة خارج النطاق تُصحَّح
+            await check_layout()
+            assert view.page == max(0, (len(view._filtered()) + ca.PAGE - 1) // ca.PAGE - 1)
+            view.current, view.mode = "game roulette", "detail"
+            e = await check_layout()
+            assert "mode" in str(e.to_dict()) and "join_seconds" in str(e.to_dict())
+            for mode in ("pick_option", "shortcuts", "pick_command"):
+                view.mode = mode
+                await check_layout()
+            view.current, view.mode = None, "shortcuts"
+            await check_layout()
+
+            def itx(user, guild_id=GUILD):
+                i = fake_interaction(user, guild_id)
+                return i
+
+            # الأمان: مستخدم آخر / سيرفر آخر / مسؤول فقد صلاحيته
+            assert not await view.interaction_check(itx(normal))
+            assert not await view.interaction_check(itx(admin, 2))
+            demoted = fake_member(1)
+            view.mode, view.current = "detail", "kick"
+            i = itx(demoted)
+            await view.on_action(i, "toggle") if await view.guard(i) else None
+            assert (await db.command_configs(GUILD)).get("kick") is None, "demoted admin changed config"
+            # نافذة مرسلة من غير مسؤول لا تغيّر شيئًا
+            modal = ca.ShortcutModal(view, "kick")
+            modal.name._value = "kk"
+            await modal.on_submit(itx(normal))
+            assert "kk" not in await db.shortcuts(GUILD)
+
+            # تعطيل/تفعيل فعلي + حماية الأوامر الأساسية
+            view.mode, view.current = "detail", "kick"
+            i = itx(admin)
+            await view.on_action(i, "toggle")
+            assert (await db.command_configs(GUILD))["kick"]["enabled"] is False
+            await view.on_action(itx(admin), "toggle")
+            assert "kick" not in await db.command_configs(GUILD)
+            view.current = "panel"
+            await view.on_action(itx(admin), "toggle")
+            assert "panel" not in await db.command_configs(GUILD)
+
+            # تعديل الوصف: معاينة ثم حفظ، والإلغاء لا يحفظ
+            view.current, view.mode = "ping", "detail"
+            modal = ca.DescModal(view, "ping", None)
+            modal.text._value = "قياس سرعة الاستجابة"
+            await modal.on_submit(itx(admin))
+            assert view.mode == "preview" and view.pending[3] == "قياس سرعة الاستجابة"
+            assert "ping" not in await db.command_configs(GUILD)               # لم يُحفظ بعد
+            await view.on_action(itx(admin), "cancel_pending")
+            assert "ping" not in await db.command_configs(GUILD) and view.mode == "detail"
+            modal = ca.DescModal(view, "ping", None)
+            modal.text._value = "قياس سرعة الاستجابة"
+            await modal.on_submit(itx(admin))
+            await view.on_action(itx(admin), "save_pending")
+            assert (await db.command_configs(GUILD))["ping"]["description"] == "قياس سرعة الاستجابة"
+            assert str(registry.find(bot.tree, "ping").description) == "قياس سرعة الاستجابة" and bot.desc_dirty
+            # وصف خيار
+            view.current, view.mode = "avatar", "detail"
+            modal = ca.DescModal(view, "avatar", "member")
+            modal.text._value = "صاحب الصورة المطلوبة"
+            await modal.on_submit(itx(admin))
+            await view.on_action(itx(admin), "save_pending")
+            assert str(registry.find(bot.tree, "avatar").parameters[0].description) == "صاحب الصورة المطلوبة"
+            # وصف طويل أو فارغ مرفوض برسالة
+            modal = ca.DescModal(view, "avatar", None)
+            modal.text._value = "x" * 150
+            await modal.on_submit(itx(admin))
+            assert view.mode != "preview" or view.pending[3] != "x" * 150
+            # الاستعادة تتطلب ضغطتين
+            view.current, view.mode = "ping", "detail"
+            await view.on_action(itx(admin), "reset")
+            assert (await db.command_configs(GUILD)).get("ping") and view.confirm == "reset"
+            await view.on_action(itx(admin), "reset")
+            assert "ping" not in await db.command_configs(GUILD)
+            assert str(registry.find(bot.tree, "ping").description) == registry.default_description("ping")
+
+            # الاختصارات من اللوحة: إضافة، تكرار، تعارض، إعادة تسمية، حذف بضغطتين
+            view.current, view.mode = "kick", "detail"
+            modal = ca.ShortcutModal(view, "kick")
+            modal.name._value = "kk"
+            await modal.on_submit(itx(admin))
+            assert (await db.shortcuts(GUILD))["kk"] == "kick" and view.mode == "shortcuts"
+            for bad in ("kk", "ban", "ping"):
+                modal = ca.ShortcutModal(view, "kick")
+                modal.name._value = bad
+                await modal.on_submit(itx(admin))
+            assert (await db.shortcuts(GUILD)) == {"bn": "ban", "kk": "kick"}
+            view.sel_shortcut = "kk"
+            modal = ca.ShortcutModal(view, "kick", rename="kk")
+            modal.name._value = "طرد"
+            await modal.on_submit(itx(admin))
+            assert (await db.shortcuts(GUILD)) == {"bn": "ban", "طرد": "kick"}
+            await view.on_action(itx(admin), "delete_shortcut")
+            assert "طرد" in await db.shortcuts(GUILD)                              # الضغطة الأولى لا تحذف
+            await view.on_action(itx(admin), "delete_shortcut")
+            assert "طرد" not in await db.shortcuts(GUILD)
+            # الاقتراحات: تُضيف غير المتعارض فقط، والتشغيل مرة ثانية لا يكرر
+            await view.on_action(itx(admin), "suggest")
+            first = dict(await db.shortcuts(GUILD))
+            assert first["bn"] == "ban" and first.get("lb") == "leaderboard" and first.get("roulette") == "game roulette"
+            await view.on_action(itx(admin), "suggest")
+            assert dict(await db.shortcuts(GUILD)) == first
+            # البادئة وتشغيل الاختصارات
+            modal = ca.PrefixModal(view, "!")
+            modal.prefix._value = "."
+            await modal.on_submit(itx(admin))
+            assert (await db.get_settings(GUILD))["shortcut_prefix"] == "."
+            modal.prefix._value = "ab"
+            await modal.on_submit(itx(admin))
+            assert (await db.get_settings(GUILD))["shortcut_prefix"] == "."
+            await view.on_action(itx(admin), "toggle_shortcuts")
+            assert (await db.get_settings(GUILD))["shortcuts_enabled"] is False
+            # بحث ومسح التصفية
+            modal = ca.SearchModal(view)
+            modal.q._value = "game"
+            view.mode, view.kind = "list", "all"
+            await modal.on_submit(itx(admin))
+            assert view.query == "game" and all("game" in c.qualified_name or "game" in str(c.description).lower()
+                                                for c in view._filtered())
+            await view.on_action(itx(admin), "clear_filter")
+            assert view.query == "" and view.kind == "all"
+            # المزامنة: تحترم مهلة الانتظار ولا تُرسل شيئًا للمنصة في الاختبار
+            from bot import registry as reg
+            reg._last_sync = __import__("time").monotonic()
+            view.mode = "list"
+            i = itx(admin)
+            await view.on_action(i, "sync")
+            shown = i.response.edit_message.await_args.kwargs["embed"]
+            assert any("انتظر" in str(f.value) for f in shown.fields), shown.to_dict()   # المهلة تمنع الطلب
+            # بعد انقضاء المهلة: تُنسخ الأوامر وتُرسل للمنصة مرة واحدة (محاكاة ديسكورد) وتُصفَّر علامة «غير مطبّق»
+            reg._last_sync = 0.0
+            bot.tree.sync = AsyncMock(return_value=[0] * 33)
+            bot.desc_dirty = True
+            os.environ["GUILD_ID"] = str(GUILD)
+            try:
+                i = itx(admin)
+                await view.on_action(i, "sync")
+            finally:
+                os.environ.pop("GUILD_ID", None)
+            assert bot.tree.sync.await_count == 1 and bot.desc_dirty is False
+            assert any(f.name.startswith("✅") for f in i.edit_original_response.await_args.kwargs["embed"].fields)
+            await view.on_action(itx(admin), "sync")                                 # فورًا: مهلة جديدة
+            assert bot.tree.sync.await_count == 1
+        finally:
+            await db.close()
+    print("OK /commands panel: layout limits, owner/guild/server-side admin lock, toggle+protection, preview-then-save, "
+          "reset confirm, shortcuts add/duplicate/conflict/rename/delete, suggestions, prefix, search, sync cooldown")
+
+
+# ====================================================================== المتجر والبطاقات والصوت والموسيقى
+async def test_shop_store_and_panel():
+    from bot import cards, images
+    from cogs import panel as pm
+    from cogs import shop as shop_mod
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            # ---- حقول جديدة + حذف ناعم يحفظ المشتريات
+            a = await db.add_shop_item(GUILD, "VIP", "وصف", 100, "custom", None, 5, 0, True,
+                                       image_url="https://example.com/a.png")
+            b = await db.add_shop_item(GUILD, "Pass", "", 50, "custom", None, -1, 0, False)
+            assert (await db.shop_item(GUILD, a))["image_url"] == "https://example.com/a.png"
+            assert (await db.shop_item(GUILD, b))["image_url"] is None and (await db.shop_item(GUILD, b))["deleted"] == 0
+            await db.admin_set(GUILD, 7, 1000, 1, "t")
+            pid, _ = await db.purchase(GUILD, 7, a)
+            assert await db.delete_shop_item(GUILD, a) and not await db.delete_shop_item(GUILD, a)
+            assert [r["id"] for r in await db.shop_items(GUILD, include_inactive=True)] == [b]
+            try:
+                await db.purchase(GUILD, 7, a)
+                raise AssertionError("deleted item purchasable")
+            except LimitReached:
+                pass
+            assert (await db.refund(GUILD, pid, 1))["price"] == 100        # الاسترداد يعمل بعد حذف المنتج
+            assert await db.balance(GUILD, 7) == 1000
+            await db.update_shop_item(GUILD, b, image_url="")
+            assert (await db.shop_item(GUILD, b))["image_url"] == ""
+
+            # ---- شراء متزامن: لا خصم مزدوج ولا تجاوز للمخزون
+            c = await db.add_shop_item(GUILD, "Limited", "", 30, "custom", None, 2, 0, False)
+            await db.admin_set(GUILD, 8, 1000, 1, "t")
+            res = await asyncio.gather(*[db.purchase(GUILD, 8, c) for _ in range(10)], return_exceptions=True)
+            ok = [r for r in res if not isinstance(r, Exception)]
+            assert len(ok) == 2 and await db.balance(GUILD, 8) == 1000 - 60 and (await db.shop_item(GUILD, c))["stock"] == 0
+
+            # ---- التحقق من رابط الصورة
+            assert images.validate_url("") == "" and images.validate_url(" https://cdn.example.com/p.png ").startswith("https")
+            for bad in ("http://example.com/a.png", "ftp://x/a", "https://127.0.0.1/a.png", "https://10.0.0.5/a.png",
+                        "https://user:pw@example.com/a.png", "https://[::1]/a.png", "javascript:alert(1)", "x" * 500):
+                try:
+                    images.validate_url(bad)
+                    raise AssertionError(bad)
+                except ValueError:
+                    pass
+            assert await images.fetch("https://127.0.0.1/a.png") is None             # SSRF محظور دون طلب شبكة
+            assert await images.fetch("http://example.com/a.png") is None
+            assert await images.fetch("") is None
+
+            # ---- المتجر المرئي: يُرسم، ويرجع للنص عند فشل الرسم
+            admin, normal = fake_member(1, admin=True), fake_member(2)
+            guild = MagicMock()
+            guild.id, guild.name = GUILD, "Test"
+            e, file, chunk, pages, page = await shop_mod.render_store(bot, guild, normal, 0)
+            assert file is not None and file.filename == "store.png" and len(chunk) == 2 and pages == 1
+            real = cards.render_store
+            cards.render_store = lambda **k: (_ for _ in ()).throw(RuntimeError("x"))
+            try:
+                e, file, chunk, pages, page = await shop_mod.render_store(bot, guild, normal, 0)
+                assert file is None and "Pass" in e.description                        # بديل نصي
+            finally:
+                cards.render_store = real
+            assert await db.delete_shop_item(GUILD, c) and await db.delete_shop_item(GUILD, b)
+            e, file, chunk, *_ = await shop_mod.render_store(bot, guild, normal, 0)
+            assert file is not None and not chunk                                      # متجر فارغ لا ينهار
+            await db.add_shop_item(GUILD, "Again", "", 10, "custom", None, -1, 0, False)
+
+            # ---- زر إدارة المتجر: لا يعمل لغير المخوّلين (فحص من الخادم)
+            view = shop_mod.StoreView(bot, normal, guild, can_manage=True)           # حتى لو ظهر الزر لسبب ما
+            btn = shop_mod._StoreBtn("manage", "x", "⚙️", row=1)
+            btn._view = view
+            i = fake_interaction(normal)
+            i.guild = guild
+            await btn.callback(i)
+            assert "لأصحاب صلاحية المتجر" in str(i.response.send_message.await_args.kwargs["embed"].description)
+            btn2 = shop_mod._StoreBtn("manage", "x", "⚙️", row=1)
+            btn2._view = shop_mod.StoreView(bot, admin, guild, can_manage=True)
+            i2 = fake_interaction(admin)
+            i2.guild = guild
+            await btn2.callback(i2)
+            assert i2.response.send_message.await_args.kwargs.get("ephemeral") is True       # لوحة مخفية للمسؤول
+            # غير صاحب المتجر لا يستطيع التحكم بأزراره
+            assert not await view.interaction_check(fake_interaction(admin))
+
+            # ---- لوحة المتجر: إضافة بصورة، تعديل، مخزون، حذف بتأكيد، ومنع غير المخوّل
+            pview = pm.PanelView(bot, admin, MagicMock(id=GUILD))
+            pview.section = pm.SECTIONS_BY_KEY["shop"]
+            item_id = None
+
+            def itx(u=admin):
+                return fake_interaction(u)
+
+            modal = pm.ItemModal(pview, kind="custom")
+            modal.name._value, modal.price._value = "Gift", "250"
+            modal.desc._value, modal.image._value, modal.stock._value = "هدية", "https://cdn.example.com/g.png", "7"
+            await modal.on_submit(itx())
+            row = [r for r in await db.shop_items(GUILD, include_inactive=True) if r["name"] == "Gift"][0]
+            item_id = row["id"]
+            assert (row["price"], row["stock"], row["image_url"]) == (250, 7, "https://cdn.example.com/g.png")
+            # رابط غير صالح يُرفض برسالة ولا يحفظ
+            bad = pm.ItemModal(pview, kind="custom")
+            bad.name._value, bad.price._value, bad.image._value, bad.stock._value = "Bad", "5", "http://x.com/a.png", "1"
+            await bad.on_submit(itx())
+            assert not [r for r in await db.shop_items(GUILD, include_inactive=True) if r["name"] == "Bad"]
+            # سعر غير رقمي
+            bad2 = pm.ItemModal(pview, kind="custom")
+            bad2.name._value, bad2.price._value, bad2.stock._value = "Bad2", "abc", "1"
+            await bad2.on_submit(itx())
+            assert not [r for r in await db.shop_items(GUILD, include_inactive=True) if r["name"] == "Bad2"]
+            # تعديل السعر والصورة
+            pview.mode, pview.target = "item", item_id
+            item = await db.shop_item(GUILD, item_id)
+            em = pm.ItemModal(pview, kind="custom", item=item)
+            em.price._value, em.image._value = "300", ""
+            await em.on_submit(itx())
+            row = await db.shop_item(GUILD, item_id)
+            assert row["price"] == 300 and row["image_url"] == "" and row["stock"] == 7
+            # المخزون
+            sm = pm.StockModal(pview, row)
+            sm.stock._value = "-1"
+            await sm.on_submit(itx())
+            assert (await db.shop_item(GUILD, item_id))["stock"] == -1
+            sm.stock._value = "abc"
+            await sm.on_submit(itx())
+            assert (await db.shop_item(GUILD, item_id))["stock"] == -1
+            # الحذف يتطلب ضغطتين، ومستخدم عادي لا يحذف
+            await pview.on_action(itx(normal), "delete_item")
+            assert (await db.shop_item(GUILD, item_id))["deleted"] == 0
+            await pview.on_action(itx(), "delete_item")
+            assert (await db.shop_item(GUILD, item_id))["deleted"] == 0 and pview.confirm_delete == item_id
+            await pview.on_action(itx(), "delete_item")
+            assert (await db.shop_item(GUILD, item_id))["deleted"] == 1
+            # عرض اللوحة بعد كل ذلك ضمن حدود ديسكورد (مع صفحات للمنتجات الكثيرة)
+            for n in range(20):
+                await db.add_shop_item(GUILD, f"P{n}", "", n, "custom", None, -1, 0, False)
+            pview.mode, pview.page = None, 1
+            em_ = await pview.build(admin)
+            assert len(pview.children) <= 25 and len(em_) <= 6000
+        finally:
+            await db.close()
+    print("OK shop: soft delete keeps refunds, image/stock fields, concurrent purchase safety, SSRF-safe image URLs, "
+          "store card + text fallback, admin button server-side check, panel add/edit/stock/delete-confirm")
+
+
+def test_info_cards():
+    from PIL import Image
+    from bot import cards
+    import io as _io
+    assert cards.available()
+    px_ = lambda b: Image.open(_io.BytesIO(b)).size
+    names = ["محمد عبدالله الطويل جدًا جدًا", "A" * 60, "🔥🔥", "سارة", ""]
+    for n in names:
+        assert px_(cards.render_balance(name=n, avatar=None, currency="نقطة", balance=0, rank=1, total_earned=0,
+                                        games_won=0, earned_today=0, daily_cap=0, guild_name=n)) == (1280, 720)
+        assert px_(cards.render_balance(name=n, avatar=b"junk", currency="x" * 30, balance=10 ** 12, rank=10 ** 5,
+                                        total_earned=10 ** 12, games_won=10 ** 6, earned_today=900, daily_cap=500,
+                                        guild_name="s")) == (1280, 720)
+        assert px_(cards.render_profile(name=n, tag="@u", avatar=None, balance=5, currency="نقطة", rank=2, games_won=1,
+                                        total_earned=9, warnings=3, roles=12, joined="2025-01-01", created="2020-01-01",
+                                        top_role=n, guild_name=n)) == (1280, 720)
+    rows = [dict(rank=i + 1, user_id=i, name=names[i % len(names)], balance=10 ** (i % 9)) for i in range(10)]
+    for k in (0, 1, 7, 10):
+        assert px_(cards.render_leaderboard(rows=rows[:k], avatars={}, viewer_id=3, viewer_rank=99, viewer_balance=1,
+                                            currency="نقطة", guild_name="g", page=1, pages=1)) == (1280, 720)
+    items = [dict(id=i, name=names[i % 5], price=10 ** i, kind="role" if i % 2 else "custom", stock=[-1, 0, 5][i % 3],
+                  duration_hours=[0, 24, 5][i % 3]) for i in range(6)]
+    for k in (0, 1, 6):
+        assert px_(cards.render_store(items=items[:k], images={0: b"junk", 1: None}, balance=1, currency="نقطة",
+                                      guild_name="g", page=1, pages=1)) == (1280, 720)
+    assert px_(cards.render_nowplaying(title="x" * 200, requester=names[0], duration="مباشر", thumbnail=b"junk",
+                                       queue_len=0, volume=150, loop=True, guild_name="g")) == (1280, 720)
+    print("OK info cards: balance/profile/leaderboard/store/now-playing at 1280x720 with long/odd/empty data and bad images")
+
+
+async def test_info_commands_use_cards_with_fallback():
+    from bot import cards
+    from cogs import economy as eco
+    from cogs import info as info_mod
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            await db.admin_set(GUILD, 5, 750, 1, "t")
+            member = fake_member(5)
+            member.display_name = "سارة"
+            member.display_avatar = SimpleNamespace(url="u", with_size=lambda n: SimpleNamespace(
+                read=AsyncMock(return_value=b"junk")))
+            member.created_at = member.joined_at = discord.utils.utcnow()
+            member.name = "sara"
+            member.roles = [SimpleNamespace(id=1, name="@everyone", is_default=lambda: True)]
+            cog = bot.get_cog("Economy")
+
+            def inter():
+                i = fake_interaction(member)
+                i.guild.name = "Test"
+                i.guild.icon = None
+                i.followup = MagicMock()
+                i.followup.send = AsyncMock()
+                return i
+
+            # بطاقة: يُرسل ملف صورة ببيانات الرصيد الحقيقية
+            i = inter()
+            await cog.balance.callback(cog, i, member=None)
+            sent = i.followup.send.await_args.kwargs
+            assert sent["file"].filename == "balance.png"
+            # فشل الرسم: بديل نصي بنفس البيانات الحقيقية
+            real = cards.render_balance
+            cards.render_balance = lambda **k: (_ for _ in ()).throw(RuntimeError("x"))
+            try:
+                i = inter()
+                await cog.balance.callback(cog, i, member=None)
+                emb = i.followup.send.await_args.kwargs["embed"]
+                assert any("750" in str(f.value) for f in emb.fields)
+            finally:
+                cards.render_balance = real
+            # الإعداد معطّل: نص مباشرة
+            await db.set_setting(GUILD, "info_cards", False)
+            i = fake_interaction(member)
+            i.guild.icon = None
+            await cog.balance.callback(cog, i, member=None)
+            assert "file" not in i.response.send_message.await_args.kwargs
+            await db.reset_setting(GUILD, "info_cards")
+            # المتصدرون: أول صفحة تُرسل كصورة
+            i = inter()
+            await cog.leaderboard.callback(cog, i)
+            assert i.followup.send.await_args.kwargs["file"].filename == "leaderboard.png"
+        finally:
+            await db.close()
+    print("OK balance/leaderboard commands: card with real data, text fallback on render failure or setting off")
+
+
+async def test_fast_game_and_trigger():
+    import datetime
+    import cogs.games as games_mod
+    from bot import registry
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            cog = bot.get_cog("Games")
+            old = discord.utils.utcnow() - datetime.timedelta(days=400)
+            assert cog.answer_key("المشتري") == cog.answer_key("مُشتري") == cog.answer_key(" المشتري ")
+            assert cog.answer_key("الأرض") == cog.answer_key("ارض") and cog.answer_key("7") == "7"
+
+            calls = []
+
+            async def recorder(interaction, reward):
+                calls.append((interaction.user.id, interaction.channel_id, reward))
+
+            real = cog._run_fast
+            cog._run_fast = recorder
+            member = fake_member(5)
+            member.created_at = member.joined_at = old
+
+            def msg(text, author=member):
+                m = fake_message(text, author)
+                m.guild.id = GUILD
+                return m
+
+            for text in ("-اسرع", "  -اسرع  ", "-أسرع"):
+                await cog.on_message(msg(text))
+            assert len(calls) == 3
+            calls.clear()
+            for text in ("اسرع", "-اسرع الان", "كلام -اسرع", "-", "", "-سريع", "/game fast"):
+                await cog.on_message(msg(text))
+            await cog.on_message(msg("-اسرع", fake_member(9, bot=True)))
+            dm = msg("-اسرع")
+            dm.guild = None
+            await cog.on_message(dm)
+            assert not calls, calls
+            await db.set_setting(GUILD, "fast_trigger", ".بدء")
+            await cog.on_message(msg("-اسرع"))
+            await cog.on_message(msg(".بدء"))
+            assert len(calls) == 1
+            await db.reset_setting(GUILD, "fast_trigger")
+            await db.save_command_config(GUILD, "game fast", enabled=False, description=None, options={}, admin_id=1)
+            await cog.on_message(msg("-اسرع"))
+            assert len(calls) == 1                         # معطّل من لوحة الأوامر
+            await db.save_command_config(GUILD, "game fast", enabled=True, description=None, options={}, admin_id=1)
+            from bot.settings_schema import SETTINGS_BY_KEY, parse_value
+            for ok in ("-اسرع", ".go", "؟سؤال"):
+                assert parse_value(SETTINGS_BY_KEY["fast_trigger"], ok) == ok
+            for bad in ("اسرع", "-", "- x", "/x", "@x", "1ab"):
+                try:
+                    parse_value(SETTINGS_BY_KEY["fast_trigger"], bad)
+                    raise AssertionError(bad)
+                except ValueError:
+                    pass
+            cog._run_fast = real
+
+            # ---- جولة كاملة عبر الرسالة: الفائز الأول فقط يُصرف له الجائزة مرة واحدة
+            question, answer, _w = games_mod.QUESTIONS[2]          # المشتري
+            winners = []
+            # load_extension يعيد تنفيذ الوحدة كنسخة جديدة، فنعدّل وحدة الكوغ الفعلية لا النسخة المستوردة سابقًا
+            sys.modules[type(cog).__module__]._rng = SimpleNamespace(choice=lambda seq: (question, answer, []),
+                                                                     randint=lambda a, b: a)
+
+            class Arrivals:
+                def __init__(self):
+                    self.queue = []
+
+                async def wait_for(self, _event, check=None, timeout=None):
+                    if self.queue:
+                        await asyncio.sleep(1.3)   # زمن بشري واقعي: الأسرع من الحد الأدنى يُرفض عمدًا (مضاد للغش)
+                    for author, text in list(self.queue):
+                        m = fake_message(text, author)
+                        m.channel.id = 5
+                        m.reply = AsyncMock(return_value=MagicMock())
+                        m.add_reaction = AsyncMock()
+                        if check(m):
+                            self.queue.remove((author, text))
+                            return m
+                    raise asyncio.TimeoutError
+
+            arr = Arrivals()
+            bot.wait_for = arr.wait_for
+            w1, w2 = fake_member(21), fake_member(22)
+            for w in (w1, w2):
+                w.created_at = w.joined_at = old
+                w.display_avatar = SimpleNamespace(url="u")
+            arr.queue = [(w1, "خطأ"), (w2, "المشتري"), (w1, "مشتري")]      # الأول صحيح هو w2
+            m0 = fake_message("-اسرع", fake_member(20))
+            m0.channel.id = 5
+            inter = games_mod.TextInteraction(bot, m0, None)
+            before = {u: await db.balance(GUILD, u) for u in (21, 22)}
+            await cog._run_fast(inter, None)
+            dbg = (before, {u: await db.balance(GUILD, u) for u in (21, 22)},
+                   [str(c.kwargs.get("embed") and c.kwargs["embed"].to_dict().get("title")) for c in
+                    m0.reply.await_args_list + m0.channel.send.await_args_list])
+            assert await db.balance(GUILD, 22) - before[22] == 20 and await db.balance(GUILD, 21) == before[21], dbg
+            assert 5 not in cog.active
+            # لا إجابات: انتهاء بلا جائزة
+            arr.queue = []
+            await db.set_setting(GUILD, "fast_seconds", 8)
+            cog.last_game.clear()
+            await cog._run_fast(games_mod.TextInteraction(bot, m0, None), None)
+        finally:
+            await db.close()
+    print("OK fast game: -trigger exact match only (bots/DMs/words ignored), custom trigger, disabled via /commands, "
+          "first correct answer wins once")
+
+
+async def test_voice_home_and_music():
+    import time as _t
+    from bot import voice_home
+    from cogs import music as music_mod
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            vh = bot.get_cog("VoiceHome")
+            assert [voice_home.backoff_for(i) for i in (1, 2, 3, 4, 5, 6, 7, 50)] == [5, 15, 30, 60, 120, 300, 300, 300]
+
+            def mk_channel(cid=900, perms=None):
+                ch = MagicMock(spec=discord.VoiceChannel)
+                ch.id, ch.name = cid, "home"
+                ch.guild = MagicMock()
+                ch.permissions_for = lambda _m: perms or discord.Permissions.all()
+                ch.connect = AsyncMock()
+                return ch
+
+            home = mk_channel()
+            guild = MagicMock()
+            guild.id = GUILD
+            guild.get_channel = lambda cid: home if cid == 900 else None
+            guild.voice_client = None
+            home.guild = guild
+            # بلا إعداد: لا اتصال
+            await vh.ensure(guild)
+            home.connect.assert_not_awaited()
+            # مع الإعداد: يتصل مرة واحدة
+            await db.set_setting(GUILD, "voice_home_channel", 900)
+            await vh.ensure(guild)
+            assert home.connect.await_count == 1
+            # فشل متكرر: تصاعد الانتظار وعدم المحاولة قبل موعدها (لا حلقة اتصال)
+            home.connect = AsyncMock(side_effect=asyncio.TimeoutError)
+            st = vh._st(GUILD)
+            st.next_try, st.failures = 0.0, 0
+            await vh.ensure(guild)
+            assert st.failures == 1 and home.connect.await_count == 1
+            for _ in range(5):
+                await vh.ensure(guild)
+            assert home.connect.await_count == 1                         # ما زال ضمن مهلة الانتظار
+            st.next_try = 0.0
+            await vh.ensure(guild)
+            assert st.failures == 2 and st.next_try - _t.monotonic() > 10   # 15 ثانية
+            # نجاح بعد الفشل يُصفّر العداد
+            home.connect = AsyncMock()
+            st.next_try = 0.0
+            await vh.ensure(guild)
+            assert st.failures == 0
+            # صلاحيات ناقصة: لا محاولة اتصال وتُسجَّل
+            home2 = mk_channel(perms=discord.Permissions(view_channel=True))
+            guild.get_channel = lambda cid: home2
+            st.next_try = 0.0
+            await vh.ensure(guild)
+            home2.connect.assert_not_awaited() and None
+            assert st.failures >= 1
+            # متصل بروم آخر: يعود للمنزل
+            guild.get_channel = lambda cid: home
+            vc = MagicMock()
+            vc.is_connected = lambda: True
+            vc.channel = SimpleNamespace(id=555, name="other")
+            vc.move_to = AsyncMock()
+            guild.voice_client = vc
+            st.next_try = 0.0
+            await vh.ensure(guild)
+            vc.move_to.assert_awaited_once_with(home)
+            # متصل بالمنزل فعلًا: لا شيء
+            vc.channel = SimpleNamespace(id=900, name="home")
+            vc.move_to.reset_mock()
+            await vh.ensure(guild)
+            vc.move_to.assert_not_awaited()
+
+            # ---- الموسيقى: رسائل أخطاء مفهومة
+            ex = music_mod.explain_error
+            assert "لم أجد" in ex(LookupError()) and "وقتًا" in ex(asyncio.TimeoutError())
+            assert "خاص" in ex(Exception("Private video")) and "تسجيل دخول" in ex(Exception("Sign in to confirm you are not a bot"))
+            assert "غير متاح" in ex(Exception("Video unavailable")) and "غير مدعوم" in ex(Exception("Unsupported URL: x"))
+            assert "شبكة" in ex(Exception("<urlopen error getaddrinfo failed>")) and "تعذّر جلب" in ex(Exception("???"))
+            # fetch_track: محاولة ثانية للأعطال العابرة ثم نجاح
+            attempts = []
+
+            def flaky(query, download=False):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise music_mod.yt_dlp.utils.DownloadError("connection timed out")
+                return {"title": "T", "webpage_url": "u", "url": "s", "duration": 65, "thumbnail": None}
+
+            real = music_mod.ytdl.extract_info
+            music_mod.ytdl.extract_info = flaky
+            try:
+                tr = await music_mod.fetch_track("q", fake_member(1))
+                assert tr.title == "T" and len(attempts) == 2 and tr.length == "1:05"
+                attempts.clear()
+                music_mod.ytdl.extract_info = lambda q, download=False: (_ for _ in ()).throw(
+                    music_mod.yt_dlp.utils.DownloadError("Video unavailable"))
+                try:
+                    await music_mod.fetch_track("q", fake_member(1))
+                    raise AssertionError
+                except music_mod.yt_dlp.utils.DownloadError:
+                    pass
+                music_mod.ytdl.extract_info = lambda q, download=False: {"entries": []}
+                try:
+                    await music_mod.fetch_track("q", fake_member(1))
+                    raise AssertionError
+                except LookupError:
+                    pass
+            finally:
+                music_mod.ytdl.extract_info = real
+
+            # ---- /play: التحقق من الروم والصلاحيات وFFmpeg وفشل البحث وتحمّل النجاح
+            music = bot.get_cog("Music")
+            mm = sys.modules[type(music).__module__]    # الوحدة الفعلية للكوغ (load_extension يعيد تنفيذها)
+            user = fake_member(30)
+            gch = MagicMock(spec=discord.VoiceChannel)
+            gch.id = 777
+            gch.permissions_for = lambda _m: discord.Permissions.all()
+            gch.connect = AsyncMock()
+            gch.mention = "<#777>"
+
+            def pi(voice_ch):
+                i = fake_interaction(user)
+                i.guild = MagicMock()
+                i.guild.id = GUILD
+                i.guild.voice_client = None
+                i.guild.me = MagicMock()
+                i.user = user
+                user.voice = SimpleNamespace(channel=voice_ch) if voice_ch else None
+                i.channel = MagicMock()
+                i.followup = MagicMock()
+                i.followup.send = AsyncMock()
+                return i
+
+            def last(i):
+                kw = (i.followup.send.await_args or i.response.send_message.await_args).kwargs
+                return kw["embed"].description or kw["embed"].title
+
+            await db.reset_setting(GUILD, "voice_home_channel")
+            os.environ.pop("VOICE_CHANNEL_ID", None)
+            i = pi(None)
+            await music._play(i, "x")
+            assert "ادخل روم صوتي" in last(i)
+            import shutil as _sh
+            real_which = _sh.which
+            mm.shutil.which = lambda *_: None
+            try:
+                i = pi(gch)
+                await music._play(i, "x")
+                assert "FFmpeg" in last(i)
+            finally:
+                mm.shutil.which = real_which
+            real_fetch = mm.fetch_track
+            mm.fetch_track = AsyncMock(side_effect=Exception("Video unavailable"))
+            try:
+                i = pi(gch)
+                await music._play(i, "x")
+                assert "غير متاح" in last(i) and gch.connect.await_count == 0   # لا اتصال قبل نجاح البحث
+            finally:
+                mm.fetch_track = real_fetch
+            mm.fetch_track = AsyncMock(return_value=mm.Track("Song", "u", "s", 100, None, user, 0.0))
+            gp = music.get_player
+            try:
+                i = pi(gch)
+                await music._play(i, "x")
+                assert gch.connect.await_count == 1
+                assert music.players[GUILD].queue and music.players[GUILD].queue[0].title == "Song"
+            finally:
+                mm.fetch_track = real_fetch
+                for pl in list(music.players.values()):
+                    pl.task.cancel()
+                music.players.clear()
+            # مع الاتصال الدائم: المستخدم يجب أن يكون في روم المنزل
+            await db.set_setting(GUILD, "voice_home_channel", 777)
+            i = pi(MagicMock(spec=discord.VoiceChannel))
+            i.guild.get_channel = lambda cid: gch
+            await music._play(i, "x")
+            assert "مثبّت" in last(i)
+        finally:
+            await db.close()
+    print("OK voice 24/7: home channel logic, escalating backoff w/o reconnect loop, move-back, missing perms; "
+          "music: clear errors, retry, no connect before search success, home-channel rule")
+
+
+async def test_duplicate_command_cleanup():
+    import main
+    bot = main.ServerBot()
+    bot.http = SimpleNamespace(bulk_upsert_global_commands=AsyncMock())
+    bot._connection = SimpleNamespace(application_id=42, user=None)
+    bot.tree.fetch_commands = AsyncMock(return_value=[SimpleNamespace(name="ban"), SimpleNamespace(name="kick")])
+    os.environ.pop("KEEP_GLOBAL_COMMANDS", None)
+    await bot._remove_stale_global_commands()
+    bot.http.bulk_upsert_global_commands.assert_awaited_once_with(42, [])
+    bot.http.bulk_upsert_global_commands.reset_mock()
+    bot.tree.fetch_commands = AsyncMock(return_value=[])
+    await bot._remove_stale_global_commands()                      # لا قديم: لا حذف
+    bot.http.bulk_upsert_global_commands.assert_not_awaited()
+    bot.tree.fetch_commands = AsyncMock(return_value=[SimpleNamespace(name="ban")])
+    os.environ["KEEP_GLOBAL_COMMANDS"] = "1"
+    try:
+        await bot._remove_stale_global_commands()
+        bot.http.bulk_upsert_global_commands.assert_not_awaited()  # الإبقاء بطلب صريح
+    finally:
+        os.environ.pop("KEEP_GLOBAL_COMMANDS", None)
+    print("OK duplicate commands: stale global copies removed only when present, opt-out respected")
+
+
+def test_visual_sizes_16x9():
+    from bot import gamecards as gc, wheel
+    from PIL import Image
+    import io as _io
+    assert (gc.W, gc.H) == (1280, 720) and abs(gc.W / gc.H - 16 / 9) < 1e-6
+    assert (wheel.CW, wheel.CH) == (960, 540)
+    names = ["أحمد", "Sara", "محمد عبدالله", "Noor", "خالد", "Lina", "عمر", "يوسف"]
+    png = wheel.render_result(names, 2, wheel.stop_angle(2, 8))
+    assert Image.open(_io.BytesIO(png)).size == (960, 540)
+    sp = wheel.render_spin(names, 2, wheel.stop_angle(2, 8), frames=30)
+    im = Image.open(_io.BytesIO(sp.gif))
+    assert im.size[0] / im.size[1] > 1.7 and len(sp.gif) < wheel.MAX_GIF_BYTES * 1.2
+    # عدد كبير من المشاركين: الأرقام على العجلة والأسماء في القائمة
+    big = [f"لاعب {i}" for i in range(50)]
+    png = wheel.render_result(big, 49, wheel.stop_angle(49, 50))
+    assert Image.open(_io.BytesIO(png)).size == (960, 540)
+    print("OK visuals: game cards 1280x720 (16:9), roulette 960x540 PNG / ~16:9 GIF, 50 players")
+
+
 GUESSING = False
 test_game_logic()
 test_wheel()
+test_gamecards()
+asyncio.run(test_visual_fallback())
+asyncio.run(test_registry_and_storage())
+asyncio.run(test_shortcut_parsing_and_execution())
+asyncio.run(test_commands_panel())
+asyncio.run(test_shop_store_and_panel())
+test_info_cards()
+asyncio.run(test_info_commands_use_cards_with_fallback())
+asyncio.run(test_fast_game_and_trigger())
+asyncio.run(test_voice_home_and_music())
+asyncio.run(test_duplicate_command_cleanup())
+test_visual_sizes_16x9()
 asyncio.run(test_other_game_flows())
 asyncio.run(test_roulette_flow())
 asyncio.run(test_permissions())

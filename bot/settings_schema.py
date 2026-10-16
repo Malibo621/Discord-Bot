@@ -18,12 +18,14 @@ SETTINGS: list[Setting] = [
     # العملة
     Setting("currency_name", "اسم العملة", "str", "نقطة", "عام"),
     Setting("currency_emoji", "رمز العملة", "str", "🪙", "عام"),
+    Setting("info_cards", "بطاقات مرئية للرصيد والملف الشخصي والمتصدرين والمتجر (وإلا نص)", "bool", True, "عام"),
 
     # القنوات
     Setting("log_channel", "روم سجل السيرفر", "channel", 0, "القنوات"),
     Setting("mod_log_channel", "روم سجل الإدارة", "channel", 0, "القنوات"),
     Setting("economy_log_channel", "روم سجل الاقتصاد", "channel", 0, "القنوات"),
     Setting("games_channel", "روم الألعاب (فارغ = كل الرومات)", "channel", 0, "القنوات"),
+    Setting("voice_home_channel", "الروم الصوتي للاتصال الدائم 24/7 (فارغ = بدون)", "channel", 0, "القنوات"),
 
     # الألعاب: تفعيل/تعطيل ومدد كل لعبة
     Setting("game_roulette_enabled", "تفعيل لعبة الروليت", "bool", True, "الألعاب"),
@@ -32,6 +34,12 @@ SETTINGS: list[Setting] = [
     Setting("game_guess_enabled", "تفعيل لعبة خمّن الرقم", "bool", True, "الألعاب"),
     Setting("game_scramble_enabled", "تفعيل لعبة فكّك الكلمة", "bool", True, "الألعاب"),
     Setting("game_math_enabled", "تفعيل لعبة الحساب السريع", "bool", True, "الألعاب"),
+    Setting("game_fast_enabled", "تفعيل لعبة اسرع (إجابة كتابية)", "bool", True, "الألعاب"),
+    Setting("fast_trigger", "كلمة بدء لعبة اسرع في الشات (تبدأ برمز، مثل -اسرع)", "str", "-اسرع", "الألعاب"),
+    Setting("fast_seconds", "مهلة لعبة اسرع (ثانية)", "int", 25, "الألعاب", 8, 120),
+    Setting("game_visuals", "عرض الألعاب كبطاقات مصوّرة (وإلا نص)", "bool", True, "الألعاب"),
+    Setting("game_animations", "تفعيل حركة المؤقت والقصاصات (إيقافها = صور ثابتة)", "bool", True, "الألعاب"),
+    Setting("game_image_in_embed", "صورة اللعبة داخل الإطار الملوّن (أصغر) بدل مرفق مستقل (أكبر)", "bool", False, "الألعاب"),
     Setting("roulette_join_seconds", "مدة التسجيل في الروليت (ثانية)", "int", 40, "الألعاب", 15, 180),
     Setting("typing_seconds", "مهلة أسرع كتابة (ثانية)", "int", 20, "الألعاب", 8, 120),
     Setting("quiz_seconds", "مهلة السؤال السريع (ثانية)", "int", 20, "الألعاب", 8, 120),
@@ -47,7 +55,12 @@ SETTINGS: list[Setting] = [
     Setting("reward_guess", "مكافأة خمّن الرقم", "int", 25, "مكافآت الألعاب", 0, 100000),
     Setting("reward_scramble", "مكافأة فكّك الكلمة", "int", 20, "مكافآت الألعاب", 0, 100000),
     Setting("reward_math", "مكافأة الحساب السريع", "int", 15, "مكافآت الألعاب", 0, 100000),
+    Setting("reward_fast", "مكافأة لعبة اسرع", "int", 20, "مكافآت الألعاب", 0, 100000),
     Setting("max_event_reward", "أقصى مكافأة لفعالية يحددها المنظّم", "int", 1000, "مكافآت الألعاب", 0, 1000000),
+
+    # الأوامر النصية المختصرة (!ban ...): تُدار من /commands
+    Setting("shortcuts_enabled", "تفعيل الاختصارات النصية (مثل !ban)", "bool", True, "الأوامر والاختصارات"),
+    Setting("shortcut_prefix", "بادئة الاختصارات النصية (1-3 رموز)", "str", "!", "الأوامر والاختصارات"),
 
     # الحماية من الاستغلال
     Setting("games_public", "السماح للجميع ببدء الألعاب", "bool", True, "مكافحة الاستغلال"),
@@ -121,6 +134,15 @@ def parse_value(setting: Setting, raw: str, channel_exists=None) -> Any:
         if not digits or (channel_exists and not channel_exists(int(digits))):
             raise ValueError("اختر الروم من القائمة.")
         return int(digits)
+    if setting.key == "fast_trigger":
+        if not 2 <= len(value) <= 20 or any(c.isspace() for c in value) or value[0].isalnum() or value[0] in "/@#<":
+            raise ValueError("كلمة البدء من 2 إلى 20 حرفًا بلا مسافات، وتبدأ برمز (مثل `-` أو `.`) كي لا تُشغَّل "
+                             "من الكلام العادي. مثال: `-اسرع`")
+        return value
+    if setting.key == "shortcut_prefix":
+        if not 1 <= len(value) <= 3 or any(c.isalnum() or c.isspace() for c in value) or any(c in "/@#<>\\" for c in value):
+            raise ValueError("البادئة من 1 إلى 3 رموز، بلا حروف أو أرقام أو مسافات، ولا تحتوي `/ @ # < > \\`. مثال: `!` أو `.`")
+        return value
     if not value or len(value) > 200:
         raise ValueError("النص يجب أن يكون بين 1 و 200 حرف.")
     if setting.key == "currency_emoji" and len(value) > 64:

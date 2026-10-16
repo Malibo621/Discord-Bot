@@ -1,6 +1,8 @@
 """معلومات العضو والسيرفر، وقائمة المساعدة التفاعلية."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from typing import Optional
 
@@ -8,8 +10,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import ui
+from bot import cards, images, ui
 from bot.utils import ts
+
+log = logging.getLogger("bot.info")
 
 # ترتيب وأوصاف أقسام قائمة المساعدة: (اسم الكوغ، العنوان، الأيقونة، الوصف)
 HELP_SECTIONS = [
@@ -20,6 +24,7 @@ HELP_SECTIONS = [
     ("Info", "المعلومات", "ℹ️", "معلومات الأعضاء والسيرفر"),
     ("Moderation", "الإدارة", "🔨", "التحذير، الكتم، الطرد والحظر"),
     ("Panel", "لوحة التحكم", "🧭", "كل إعدادات البوت بالأزرار والقوائم (للإدارة)"),
+    ("CmdAdmin", "الأوامر والاختصارات", "🧩", "استعراض الأوامر وتعطيلها واختصاراتها النصية (للمسؤولين)"),
     ("Settings", "الإعدادات", "⚙️", "إعدادات البوت والصلاحيات بالأوامر (للمسؤولين)"),
 ]
 
@@ -97,6 +102,23 @@ class Info(commands.Cog):
         s = await self.bot.db.get_settings(interaction.guild_id)
         w = await self.bot.db.wallet(interaction.guild_id, m.id)
         warns = len(await self.bot.db.warnings(interaction.guild_id, m.id))
+        if s["info_cards"] and cards.available() and not m.bot:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+                top = next((r for r in reversed(m.roles) if not r.is_default()), None)
+                png = await asyncio.to_thread(
+                    cards.render_profile, name=m.display_name, tag=f"@{m.name}", avatar=await images.avatar(m),
+                    balance=w["balance"], currency=s["currency_name"], rank=w["rank"], games_won=w["games_won"],
+                    total_earned=w["total_earned"], warnings=warns, roles=max(0, len(m.roles) - 1),
+                    joined=m.joined_at.strftime("%Y-%m-%d") if m.joined_at else "—",
+                    created=m.created_at.strftime("%Y-%m-%d"), top_role=top.name if top else "",
+                    guild_name=interaction.guild.name)
+                return await ui.reply_card(interaction, png, "profile.png",
+                                           f"الملف الشخصي لـ {m.display_name}: رصيد {w['balance']:,}، ترتيب {w['rank']}",
+                                           in_embed=s["game_image_in_embed"])
+            except Exception:  # noqa: BLE001
+                log.exception("Profile card failed; using text fallback")
         e = ui.info(f"👤 {m.display_name}", f"{m.mention} • `{m}`", m.color.value or ui.Colors.PRIMARY)
         e.set_thumbnail(url=m.display_avatar.url)
         e.add_field(name="🆔 الآيدي", value=f"`{m.id}`")

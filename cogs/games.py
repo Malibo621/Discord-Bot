@@ -26,8 +26,10 @@ from bot.checks import has_category, require
 from bot.game_data import QUESTIONS, WORDS
 from bot.game_logic import (GuessState, make_math_problem, parse_number, quiz_options, scramble,
                             scramble_hint)
+from bot import registry
+from bot.shortcuts import TextInteraction
 from bot.utils import earning_block_reason, has_invisible, normalize, obfuscate
-from bot import wheel
+from bot import gamecards, wheel
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,8 @@ GAMES: dict[str, GameInfo] = {
                          "اكتب الكلمة الصحيحة في الشات — يظهر تلميح في منتصف الوقت", "scramble_seconds"),
     "math": GameInfo("الحساب السريع", "🧮", "حل المسألة الحسابية قبل الجميع",
                      "اكتب الناتج في الشات (يقبل الأرقام العربية)", "math_seconds"),
+    "fast": GameInfo("اسرع", "⚡", "سؤال عام وأول من يكتب الإجابة الصحيحة يفوز (ابدأه بكتابة -اسرع)",
+                     "اكتب الإجابة في الشات — أول إجابة صحيحة تفوز", "fast_seconds"),
 }
 GAME_NAMES = {k: g.name for k, g in GAMES.items()}
 
@@ -73,6 +77,8 @@ class GameContext:
     views: list[discord.ui.View] = field(default_factory=list)
     helpers: list[asyncio.Task] = field(default_factory=list)
     awarded: bool = False
+    visual: bool = False        # تُعرض اللعبة كبطاقة صورة (وإلا نص احتياطي)
+    in_embed: bool = False      # الصورة داخل الـ Embed (أصغر) أم مرفق مستقل (أكبر)
 
 
 class Games(commands.Cog):
@@ -128,21 +134,40 @@ class Games(commands.Cog):
         for t in ctx.helpers:
             t.cancel()
 
+    def _visual_ok(self, interaction: discord.Interaction, s: dict) -> bool:
+        """البطاقات المصوّرة تتطلب خطًا عربيًا، وصلاحية رفع الملفات، وأن تكون مفعّلة من الإدارة."""
+        perms = interaction.app_permissions
+        return bool(s["game_visuals"] and gamecards.available() and perms.attach_files and perms.embed_links)
+
+    @staticmethod
+    def _reward_label(ctx: GameContext, s: dict) -> Optional[str]:
+        return f"{ctx.reward:,} {s['currency_name']}" if ctx.reward else None
+
+    @staticmethod
+    def _file(image: tuple[bytes, str], name: str = "card", alt: Optional[str] = None) -> discord.File:
+        data, ext = image
+        return discord.File(io.BytesIO(data), f"{name}.{ext}", description=(alt or None) and alt[:1000])
+
     def _card(self, ctx: GameContext, s: dict, body: str, *, ends_at: Optional[int] = None,
-              footer: Optional[str] = None) -> discord.Embed:
-        """بطاقة اللعبة الموحّدة: العنوان، المحتوى، الجائزة، والوقت المتبقي."""
+              footer: Optional[str] = None, image: Optional[tuple[bytes, str]] = None,
+              name: str = "card") -> discord.Embed:
+        """بطاقة اللعبة الموحّدة: العنوان، المحتوى (أو صورة اللعبة)، الجائزة، والوقت المتبقي."""
         info = GAMES[ctx.game]
         title = f"{info.emoji}  {info.name}" + ("  ·  🎉 فعالية خاصة" if ctx.is_event else "")
-        e = ui.info(title, body, ui.Colors.GOLD if ctx.is_event else ui.Colors.GAME)
+        ctx.in_embed = bool(s.get("game_image_in_embed"))
+        e = ui.info(title, None if image else body, ui.Colors.GOLD if ctx.is_event else ui.Colors.GAME)
         e.add_field(name="🏆 الجائزة", value=ui.money(ctx.reward, s) if ctx.reward else "`بدون جائزة`")
         if ends_at:
             e.add_field(name="⏱️ ينتهي", value=ui.countdown(ends_at))
+        if image and ctx.in_embed:   # الافتراضي: مرفق مستقل، فيعرضه ديسكورد بحجم أكبر من صور الـ Embed
+            e.set_image(url=f"attachment://{name}.{image[1]}")
         e.set_footer(text=footer or info.howto)
         ctx.card = e
         return e
 
-    async def _close(self, ctx: GameContext, status: str, view: Optional[discord.ui.View] = None) -> None:
-        """تحويل بطاقة اللعبة إلى حالة «انتهت» حتى لا يحاول أحد الإجابة عليها."""
+    async def _close(self, ctx: GameContext, status: str, view: Optional[discord.ui.View] = None,
+                     result: Optional[tuple[bytes, str]] = None) -> None:
+        """تحويل بطاقة اللعبة إلى حالة «انتهت» (مع شاشة النتيجة إن وُجدت) حتى لا يحاول أحد الإجابة عليها."""
         if not ctx.card:
             return
         e = ctx.card.copy()
@@ -154,10 +179,38 @@ class Games(commands.Cog):
         else:
             e.add_field(name="⏹️ الحالة", value=status, inline=True)
         e.set_footer(text="انتهت اللعبة — ابدأ جولة جديدة من /game")
-        await ui.safe_edit(ctx.message, embed=e, view=view)
+        kwargs = {}
+        if result:
+            if ctx.in_embed:
+                e.set_image(url=f"attachment://result.{result[1]}")
+            kwargs["attachments"] = [self._file(result, "result")]
+        await ui.safe_edit(ctx.message, embed=e, view=view, **kwargs)
+
+    async def _result_image(self, ctx: GameContext, s: dict, headline: str, details: list[tuple[str, str]], *,
+                            winner: Optional[discord.Member] = None) -> Optional[tuple[bytes, str]]:
+        """شاشة النتيجة المصوّرة (فائز بأفاتاره + قصاصات، أو كشف الإجابة عند انتهاء الوقت)."""
+        if not ctx.visual:
+            return None
+        avatar = None
+        if winner is not None:
+            try:
+                avatar = await winner.display_avatar.with_size(128).read()
+            except Exception:  # noqa: BLE001 - الأفاتار تحسين بصري فقط
+                avatar = None
+        try:
+            return await asyncio.to_thread(
+                gamecards.render_result, ctx.game, wheel.clean_name(headline, 18) or "الفائز", details,
+                winner=winner is not None, avatar=avatar, reward=self._reward_label(ctx, s),
+                animate=s["game_animations"], event=ctx.is_event)
+        except Exception:  # noqa: BLE001
+            ui.log.exception("Result card failed")
+            return None
 
     async def _send_card(self, interaction: discord.Interaction, ctx: GameContext, embed: discord.Embed,
-                         view: Optional[discord.ui.View] = None, file: Optional[discord.File] = None):
+                         view: Optional[discord.ui.View] = None, file: Optional[discord.File] = None,
+                         image: Optional[tuple[bytes, str]] = None, alt: Optional[str] = None):
+        if image is not None:
+            file = self._file(image, alt=alt)
         await ui.reply(interaction, embed, view=view, file=file)
         try:
             ctx.message = await interaction.original_response()
@@ -167,6 +220,17 @@ class Games(commands.Cog):
             ctx.views.append(view)
             if isinstance(view, ui.BaseView):
                 view.message = ctx.message
+
+    async def _render(self, ctx: GameContext, fn, *args, **kwargs) -> Optional[tuple[bytes, str]]:
+        """يولّد صورة اللعبة في خيط منفصل؛ عند الفشل تعود اللعبة للنص بدل أن تتعطل."""
+        if not ctx.visual:
+            return None
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except Exception:  # noqa: BLE001
+            ui.log.exception("Game card render failed")
+            ctx.visual = False
+            return None
 
     async def _award(self, guild: discord.Guild, member: discord.Member, ctx: GameContext) -> str:
         """يمنح الفائز نقاطه مرة واحدة فقط، بعد التحقق من الأهلية والحد اليومي، ويرجع سطر النتيجة."""
@@ -260,8 +324,12 @@ class Games(commands.Cog):
             seconds = s["typing_seconds"]
             word = _rng.choice(await self._word_pool(interaction.guild_id))
             ends = int(time.time()) + seconds
+            ctx.visual = self._visual_ok(interaction, s)
             body = f"اكتب الكلمة التالية بأسرع ما يمكن:\n# {obfuscate(word)}\n-# {len(word)} حرف"
-            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends))
+            image = await self._render(ctx, gamecards.render_typing, word, seconds, self._reward_label(ctx, s),
+                                       ctx.is_event, s["game_animations"])
+            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends, image=image),
+                                  image=image, alt=f"اكتب الكلمة: {word}")
             started = time.monotonic()
             target = normalize(word)
             min_time = 0.6 + 0.07 * len(word)  # أسرع من هذا = غير بشري
@@ -275,17 +343,18 @@ class Games(commands.Cog):
 
             msg = await self._wait_message(check, seconds)
             if not msg:
-                await self._close(ctx, "لم يكتبها أحد")
+                result = await self._result_image(ctx, s, word, [("الكلمة", word)])
+                await self._close(ctx, "لم يكتبها أحد", result=result)
                 return await self._announce(interaction.channel, self._timeout_embed(ctx, f"**الكلمة:** {word}"))
             elapsed = time.monotonic() - started
             await self._react(msg, "⚡")
             extra = await self._award(interaction.guild, msg.author, ctx)
-            await self._close(ctx, f"فاز {msg.author.mention}")
             cps = len(word) / elapsed if elapsed else 0
+            details = [("الوقت", f"{elapsed:.2f} ث"), ("السرعة", f"{cps:.1f} حرف/ث"), ("الكلمة", word)]
+            result = await self._result_image(ctx, s, msg.author.display_name, details, winner=msg.author)
+            await self._close(ctx, f"فاز {msg.author.mention}", result=result)
             await self._announce(interaction.channel, self._win_embed(
-                ctx, msg.author, f"{msg.author.mention} كان الأسرع!",
-                [("الكلمة", f"`{word}`"), ("الوقت", f"`{elapsed:.2f}` ثانية"), ("السرعة", f"`{cps:.1f}` حرف/ث")],
-                extra), reply_to=msg)
+                ctx, msg.author, f"{msg.author.mention} كان الأسرع!", details, extra), reply_to=msg)
         finally:
             self._finish(ctx)
 
@@ -303,8 +372,13 @@ class Games(commands.Cog):
             word = _rng.choice(pool or WORDS)
             mixed = scramble(word, _rng)
             ends = int(time.time()) + seconds
+            ctx.visual = self._visual_ok(interaction, s)
             body = f"رتّب الحروف لتكوين كلمة صحيحة:\n# {'  '.join(mixed)}"
-            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends))
+            rl = self._reward_label(ctx, s)
+            image = await self._render(ctx, gamecards.render_scramble, list(mixed), seconds, rl, None,
+                                       ctx.is_event, s["game_animations"])
+            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends, image=image),
+                                  image=image, alt="حروف مبعثرة: " + " ".join(mixed))
             started = time.monotonic()
             target = normalize(word)
 
@@ -313,21 +387,29 @@ class Games(commands.Cog):
                         and not has_invisible(m.content) and normalize(m.content) == target)
 
             msg = await self._wait_message(check, seconds / 2)
-            if not msg:  # تلميح في منتصف الوقت
-                hinted = self._card(ctx, s, body, ends_at=ends)
-                hinted.add_field(name="💡 تلميح", value=scramble_hint(word), inline=False)
-                await ui.safe_edit(ctx.message, embed=hinted)
+            if not msg:  # تلميح في منتصف الوقت (صورة ثابتة جديدة بدل إعادة تشغيل المؤقت)
+                hint = scramble_hint(word)
+                left = max(1, seconds - int(time.monotonic() - started))
+                hinted_img = await self._render(ctx, gamecards.render_scramble, list(mixed), left, rl, hint,
+                                                ctx.is_event, False)
+                hinted = self._card(ctx, s, body, ends_at=ends, image=hinted_img)
+                if not hinted_img:
+                    hinted.add_field(name="💡 تلميح", value=hint, inline=False)
+                kwargs = {"attachments": [self._file(hinted_img)]} if hinted_img else {}
+                await ui.safe_edit(ctx.message, embed=hinted, **kwargs)
                 msg = await self._wait_message(check, seconds - (time.monotonic() - started))
             if not msg:
-                await self._close(ctx, "لم يفكّها أحد")
+                result = await self._result_image(ctx, s, word, [("الكلمة", word)])
+                await self._close(ctx, "لم يفكّها أحد", result=result)
                 return await self._announce(interaction.channel, self._timeout_embed(ctx, f"**الكلمة:** {word}"))
             elapsed = time.monotonic() - started
             await self._react(msg, "🧩")
             extra = await self._award(interaction.guild, msg.author, ctx)
-            await self._close(ctx, f"فاز {msg.author.mention}")
+            details = [("الوقت", f"{elapsed:.2f} ث"), ("الكلمة", word)]
+            result = await self._result_image(ctx, s, msg.author.display_name, details, winner=msg.author)
+            await self._close(ctx, f"فاز {msg.author.mention}", result=result)
             await self._announce(interaction.channel, self._win_embed(
-                ctx, msg.author, f"{msg.author.mention} فكّك الكلمة!",
-                [("الكلمة", f"`{word}`"), ("الوقت", f"`{elapsed:.2f}` ثانية")], extra), reply_to=msg)
+                ctx, msg.author, f"{msg.author.mention} فكّك الكلمة!", details, extra), reply_to=msg)
         finally:
             self._finish(ctx)
 
@@ -343,8 +425,12 @@ class Games(commands.Cog):
             seconds = s["math_seconds"]
             problem = make_math_problem(_rng)
             ends = int(time.time()) + seconds
+            ctx.visual = self._visual_ok(interaction, s)
             body = f"احسب الناتج:\n# {problem.text} = ؟\n-# المستوى: {problem.level}"
-            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends))
+            image = await self._render(ctx, gamecards.render_math, problem.text, seconds,
+                                       self._reward_label(ctx, s), problem.level, ctx.is_event, s["game_animations"])
+            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends, image=image),
+                                  image=image, alt=f"المسألة: {problem.text}")
             started = time.monotonic()
 
             def check(m: discord.Message):
@@ -353,17 +439,18 @@ class Games(commands.Cog):
 
             msg = await self._wait_message(check, seconds)
             if not msg:
-                await self._close(ctx, "لم يحلها أحد")
+                result = await self._result_image(ctx, s, str(problem.answer), [("المسألة", problem.text)])
+                await self._close(ctx, "لم يحلها أحد", result=result)
                 return await self._announce(interaction.channel, self._timeout_embed(
                     ctx, f"**الحل:** {problem.text} = **{problem.answer}**"))
             elapsed = time.monotonic() - started
             await self._react(msg, "🧠")
             extra = await self._award(interaction.guild, msg.author, ctx)
-            await self._close(ctx, f"فاز {msg.author.mention}")
+            details = [("الوقت", f"{elapsed:.2f} ث"), ("الناتج", str(problem.answer)), ("المسألة", problem.text)]
+            result = await self._result_image(ctx, s, msg.author.display_name, details, winner=msg.author)
+            await self._close(ctx, f"فاز {msg.author.mention}", result=result)
             await self._announce(interaction.channel, self._win_embed(
-                ctx, msg.author, f"{msg.author.mention} حلّها أولًا!",
-                [("المسألة", f"`{problem.text} = {problem.answer}`"), ("الوقت", f"`{elapsed:.2f}` ثانية")],
-                extra), reply_to=msg)
+                ctx, msg.author, f"{msg.author.mention} حلّها أولًا!", details, extra), reply_to=msg)
         finally:
             self._finish(ctx)
 
@@ -380,24 +467,35 @@ class Games(commands.Cog):
             seconds, max_tries = s["guess_seconds"], s["guess_max_tries"]
             state = GuessState(_rng.randint(1, maximum), maximum, max_tries)
             ends = int(time.time()) + seconds
+            ctx.visual = self._visual_ok(interaction, s)
+            last_note: list[Optional[str]] = [None]
+            rl = self._reward_label(ctx, s)
 
-            def render() -> discord.Embed:
+            def text_body() -> str:
                 span = state.high - state.low + 1
-                body = (f"فكرت برقم بين **1** و **{maximum:,}**\n"
+                return (f"فكرت برقم بين **1** و **{maximum:,}**\n"
                         f"# {state.low:,}  ⟷  {state.high:,}\n"
                         f"{ui.progress_bar(maximum - span, maximum - 1, 14)}  النطاق يضيق!\n"
                         f"-# لكل عضو {max_tries} محاولات  ·  عدد التخمينات: {state.total}")
-                return self._card(ctx, s, body, ends_at=ends)
 
-            await self._send_card(interaction, ctx, render())
+            async def render() -> tuple[discord.Embed, Optional[tuple[bytes, str]]]:
+                image = await self._render(ctx, gamecards.render_guess, state.low, state.high, maximum,
+                                           state.total, max_tries, rl, ctx.is_event, last_note[0])
+                return self._card(ctx, s, text_body(), ends_at=ends, image=image), image
+
+            embed, image = await render()
+            await self._send_card(interaction, ctx, embed, image=image,
+                                  alt=f"خمّن رقمًا بين {state.low} و {state.high}")
             dirty = asyncio.Event()
 
-            async def updater():  # تحديث البطاقة بحد أقصى مرة كل 2.5 ثانية لتجنب حدود ديسكورد
+            async def updater():  # تحديث البطاقة بحد أقصى مرة كل 3 ثوانٍ لتجنب حدود ديسكورد وتوليد الصور
                 while True:
                     await dirty.wait()
                     dirty.clear()
-                    await ui.safe_edit(ctx.message, embed=render())
-                    await asyncio.sleep(2.5)
+                    e, img = await render()
+                    kwargs = {"attachments": [self._file(img)]} if img else {}
+                    await ui.safe_edit(ctx.message, embed=e, **kwargs)
+                    await asyncio.sleep(3)
 
             ctx.helpers.append(asyncio.create_task(updater()))
 
@@ -409,24 +507,28 @@ class Games(commands.Cog):
             while True:
                 msg = await self._wait_message(check, ends - time.time())
                 if not msg:
-                    await self._close(ctx, "انتهى الوقت")
+                    result = await self._result_image(ctx, s, str(state.secret), [("الرقم", str(state.secret))])
+                    await self._close(ctx, "انتهى الوقت", result=result)
                     return await self._announce(interaction.channel, self._timeout_embed(
                         ctx, f"**الرقم كان:** {state.secret}"))
-                result = state.guess(msg.author.id, parse_number(msg.content))
-                if result == "win":
+                n = parse_number(msg.content)
+                outcome = state.guess(msg.author.id, n)
+                if outcome == "win":
                     break
-                await self._react(msg, reactions[result])
-                if result in ("higher", "lower"):
+                await self._react(msg, reactions[outcome])
+                if outcome in ("higher", "lower"):
+                    last_note[0] = f"آخر تخمين {n} — الرقم {'أكبر' if outcome == 'higher' else 'أصغر'}"
                     dirty.set()
 
             used = state.tries[msg.author.id]
             await self._react(msg, "🎯")
             extra = await self._award(interaction.guild, msg.author, ctx)
-            await self._close(ctx, f"فاز {msg.author.mention}")
+            details = [("الرقم", str(state.secret)), ("محاولاته", f"{used} من {max_tries}"),
+                       ("التخمينات", str(state.total))]
+            result = await self._result_image(ctx, s, msg.author.display_name, details, winner=msg.author)
+            await self._close(ctx, f"فاز {msg.author.mention}", result=result)
             await self._announce(interaction.channel, self._win_embed(
-                ctx, msg.author, f"{msg.author.mention} أصاب الرقم!",
-                [("الرقم", f"`{state.secret}`"), ("محاولاته", f"`{used}` من {max_tries}"),
-                 ("مجموع التخمينات", f"`{state.total}`")], extra), reply_to=msg)
+                ctx, msg.author, f"{msg.author.mention} أصاب الرقم!", details, extra), reply_to=msg)
         finally:
             self._finish(ctx)
 
@@ -444,23 +546,110 @@ class Games(commands.Cog):
             options = quiz_options(answer, wrong, _rng)
             view = QuizView(options, answer, seconds)
             ends = int(time.time()) + seconds
+            ctx.visual = self._visual_ok(interaction, s)
             body = f"### {question}\n" + "\n".join(f"{QuizView.LETTERS[i]}  {o}" for i, o in enumerate(options))
-            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends), view=view)
+            image = await self._render(ctx, gamecards.render_quiz, question, options, seconds,
+                                       self._reward_label(ctx, s), ctx.is_event, s["game_animations"])
+            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends, image=image), view=view,
+                                  image=image, alt=f"{question} — " + "، ".join(options))
             await view.wait()
             view.reveal()
             stats = f"أجاب {len(view.attempted)} عضو"
             if not view.winner:
-                await self._close(ctx, stats, view=view)
+                result = await self._result_image(ctx, s, answer, [("الإجابة", answer)])
+                await self._close(ctx, stats, view=view, result=result)
                 return await self._announce(interaction.channel, self._timeout_embed(
                     ctx, f"**الإجابة الصحيحة:** {answer}"))
             extra = await self._award(interaction.guild, view.winner, ctx)
-            await self._close(ctx, f"فاز {view.winner.mention}  ·  {stats}", view=view)
+            details = [("الوقت", f"{view.elapsed:.2f} ث"), ("الإجابة", answer), ("حاولوا", str(len(view.attempted)))]
+            result = await self._result_image(ctx, s, view.winner.display_name, details, winner=view.winner)
+            await self._close(ctx, f"فاز {view.winner.mention}  ·  {stats}", view=view, result=result)
             await self._announce(interaction.channel, self._win_embed(
-                ctx, view.winner, f"{view.winner.mention} أجاب صح أولًا!",
-                [("الإجابة", f"**{answer}**"), ("الوقت", f"`{view.elapsed:.2f}` ثانية"),
-                 ("حاولوا", f"`{len(view.attempted)}` عضو")], extra), reply_to=ctx.message)
+                ctx, view.winner, f"{view.winner.mention} أجاب صح أولًا!", details, extra), reply_to=ctx.message)
         finally:
             self._finish(ctx)
+
+    # ================================================================== اسرع (إجابة كتابية)
+    @staticmethod
+    def answer_key(text: str) -> str:
+        """تطبيع الإجابة للمقارنة: الهمزات/التشكيل/المسافات، وتجاهل «ال» التعريف في أول الكلمة."""
+        t = normalize(text)
+        return t[2:] if t.startswith("ال") and len(t) > 3 else t
+
+    @game.command(name="fast", description="تحدي سرعة: سؤال تجيب عليه بالكتابة، وأول إجابة صحيحة تفوز")
+    @app_commands.describe(reward="مكافأة مخصصة (لمنظمي الفعاليات)")
+    async def fast(self, interaction: discord.Interaction, reward: RewardOpt = None):
+        await self._run_fast(interaction, reward)
+
+    async def _run_fast(self, interaction, reward: Optional[int]) -> None:
+        """جولة «اسرع»: مشتركة بين /game fast وكتابة -اسرع في الشات (نفس الفحوص والمكافأة)."""
+        ctx = await self._prepare(interaction, "fast", reward)
+        if not ctx:
+            return
+        try:
+            s = await self.bot.db.get_settings(interaction.guild_id)
+            seconds = s["fast_seconds"]
+            question, answer, _wrong = _rng.choice(await self._question_pool(interaction.guild_id))
+            ends = int(time.time()) + seconds
+            ctx.visual = self._visual_ok(interaction, s)
+            rl = self._reward_label(ctx, s)
+            body = f"### {question}\n-# اكتب الإجابة في الشات — أول إجابة صحيحة تفوز"
+            image = await self._render(ctx, gamecards.render_fast, question, seconds, rl, None, ctx.is_event,
+                                       s["game_animations"])
+            await self._send_card(interaction, ctx, self._card(ctx, s, body, ends_at=ends, image=image),
+                                  image=image, alt=f"سؤال: {question}")
+            started = time.monotonic()
+            target = self.answer_key(answer)
+            min_time = 0.8 + 0.04 * len(answer)  # أسرع من هذا غير بشري (نسخ/آلي)
+
+            def check(m: discord.Message):
+                if m.channel.id != interaction.channel_id or m.author.bot or has_invisible(m.content):
+                    return False
+                if self.answer_key(m.content) != target:
+                    return False
+                return time.monotonic() - started >= min_time
+
+            msg = await self._wait_message(check, seconds / 2)
+            if not msg:   # تلميح في منتصف الوقت: أول حرف وعدد الحروف
+                hint = f"تبدأ بحرف «{answer[0]}» • {len(answer)} حرفًا"
+                left = max(1, seconds - int(time.monotonic() - started))
+                img2 = await self._render(ctx, gamecards.render_fast, question, left, rl, hint, ctx.is_event, False)
+                e2 = self._card(ctx, s, body, ends_at=ends, image=img2)
+                if not img2:
+                    e2.add_field(name="💡 تلميح", value=hint, inline=False)
+                kwargs = {"attachments": [self._file(img2)]} if img2 else {}
+                await ui.safe_edit(ctx.message, embed=e2, **kwargs)
+                msg = await self._wait_message(check, seconds - (time.monotonic() - started))
+            if not msg:
+                result = await self._result_image(ctx, s, answer, [("الإجابة", answer)])
+                await self._close(ctx, "لم يجب أحد", result=result)
+                return await self._announce(interaction.channel, self._timeout_embed(
+                    ctx, f"**الإجابة الصحيحة:** {answer}"))
+            elapsed = time.monotonic() - started
+            await self._react(msg, "⚡")
+            extra = await self._award(interaction.guild, msg.author, ctx)
+            details = [("الوقت", f"{elapsed:.2f} ث"), ("الإجابة", answer)]
+            result = await self._result_image(ctx, s, msg.author.display_name, details, winner=msg.author)
+            await self._close(ctx, f"فاز {msg.author.mention}", result=result)
+            await self._announce(interaction.channel, self._win_embed(
+                ctx, msg.author, f"{msg.author.mention} كان الأسرع!", details, extra), reply_to=msg)
+        finally:
+            self._finish(ctx)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """-اسرع: كلمة بدء نصية بالضبط (برمز في أولها) — لا تلتقط الكلام العادي إطلاقًا."""
+        if message.author.bot or message.guild is None or not message.content:
+            return
+        if not isinstance(message.author, discord.Member) or message.content[0].isalnum():
+            return   # ترشيح سريع قبل أي قراءة للإعدادات: كلمة البدء تبدأ برمز دائمًا
+        s = await self.bot.db.get_settings(message.guild.id)
+        trigger = s["fast_trigger"]
+        if not trigger or normalize(message.content.strip()) != normalize(trigger):
+            return
+        if await registry.is_disabled(self.bot, message.guild.id, "game fast"):
+            return
+        await self._run_fast(TextInteraction(self.bot, message, None), None)
 
     # ================================================================== الروليت
     @game.command(name="roulette", description="عجلة الروليت — العجلة تدور وتختار الفائز")
@@ -504,7 +693,7 @@ class Games(commands.Cog):
             e = self._card(ctx, s, body, footer="🟢 بانتظار المشاركين")
             e.add_field(name=f"👥 المشاركون  {len(lobby.players)}/{RouletteLobby.MAX}",
                         value=self._players_block(lobby.players), inline=False)
-            if can_attach:
+            if can_attach and s["game_image_in_embed"]:
                 e.set_image(url="attachment://wheel.png")
             return e
 
@@ -551,9 +740,10 @@ class Games(commands.Cog):
         spin_embed = self._card(ctx, s, spin_body, footer="⏳ لحظات ويتوقف المؤشر...")
         spin_wait = 1.5
         files = []
-        if can_attach:
+        if can_attach and s["game_animations"]:   # تقليل الحركة: بدون GIF تُعرض النتيجة مباشرة
             spin = await asyncio.to_thread(wheel.render_spin, names, win_idx, angle)
-            spin_embed.set_image(url="attachment://spin.gif")
+            if s["game_image_in_embed"]:
+                spin_embed.set_image(url="attachment://spin.gif")
             files = [discord.File(io.BytesIO(spin.gif), "spin.gif")]
             spin_wait = (spin.duration_ms - 2500) / 1000 + 1.2
         msg = await self._present(interaction.channel, ctx, spin_embed, files)
@@ -572,7 +762,8 @@ class Games(commands.Cog):
         files = []
         if can_attach:
             png = await asyncio.to_thread(wheel.render_result, names, win_idx, angle)
-            result.set_image(url="attachment://result.png")
+            if s["game_image_in_embed"]:
+                result.set_image(url="attachment://result.png")
             files = [discord.File(io.BytesIO(png), "result.png")]
         if not await ui.safe_edit(msg, embed=result, attachments=files):
             await ui.safe_send(interaction.channel, embed=result, files=files)
@@ -612,7 +803,8 @@ class Games(commands.Cog):
             files = []
             if can_attach:
                 png = await asyncio.to_thread(wheel.render_result, names, idx, angle)
-                e.set_image(url="attachment://round.png")
+                if s["game_image_in_embed"]:
+                    e.set_image(url="attachment://round.png")
                 files = [discord.File(io.BytesIO(png), "round.png")]
             if len(others) > 25:  # القائمة لا تتسع: الإقصاء عشوائي
                 out, reason = _rng.choice(players), "🎲 العدد كبير، فاختارت العجلة عشوائيًا"
@@ -634,7 +826,7 @@ class Games(commands.Cog):
             done = ui.info(f"❌  خرج {out.display_name}",
                            f"{reason}\n\n**المتبقون ({len(players)}):** " + " ".join(m.mention for m in players),
                            ui.Colors.ERROR)
-            if files:
+            if files and s["game_image_in_embed"]:
                 done.set_image(url="attachment://round.png")
             await ui.safe_edit(msg, embed=done, view=None)
         await asyncio.sleep(1.5)

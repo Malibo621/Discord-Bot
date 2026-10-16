@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
+import shutil
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -13,8 +15,10 @@ import yt_dlp
 from discord import app_commands
 from discord.ext import commands
 
-from bot import ui
+from bot import cards, images, ui, voice_home
 from bot.checks import has_category
+
+log = logging.getLogger("bot.music")
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -52,9 +56,43 @@ class Track:
         return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
+def explain_error(exc: BaseException) -> str:
+    """رسالة مفهومة للمستخدم بدل الفشل الصامت (التفاصيل الكاملة تُسجَّل في الـ log)."""
+    text = str(exc).lower()
+    if isinstance(exc, LookupError):
+        return "لم أجد نتيجة لهذا البحث. جرّب اسمًا أوضح أو أضف اسم الفنان."
+    if isinstance(exc, asyncio.TimeoutError):
+        return "استغرق البحث وقتًا طويلًا. حاول مرة أخرى بعد قليل."
+    if "private video" in text or "members-only" in text:
+        return "هذا المقطع خاص أو للأعضاء فقط."
+    if "sign in" in text or "confirm your age" in text or "age-restricted" in text or "not a bot" in text:
+        return "يوتيوب يطلب تسجيل دخول أو تحققًا عمريًا لهذا المقطع. جرّب مقطعًا آخر."
+    if "unavailable" in text or "not available" in text or "removed" in text or "blocked" in text:
+        return "هذا المقطع غير متاح (محذوف أو محجوب في منطقة البوت). جرّب غيره."
+    if "unsupported url" in text:
+        return "الرابط غير مدعوم. استخدم اسم الأغنية أو رابط يوتيوب/ساوند كلاود."
+    if any(k in text for k in ("urlopen error", "timed out", "connection", "getaddrinfo", "network")):
+        return "تعذّر الاتصال بمصدر الأغاني (شبكة). حاول بعد قليل."
+    return "تعذّر جلب الأغنية. جرّب اسمًا أو رابطًا آخر."
+
+
 async def fetch_track(query: str, requester: discord.Member) -> Track:
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
+    last: Optional[BaseException] = None
+    data = None
+    for attempt in (1, 2):   # محاولة ثانية للأعطال العابرة فقط
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False)), timeout=45)
+            break
+        except yt_dlp.utils.DownloadError as exc:
+            last = exc
+            if "unavailable" in str(exc).lower() or "private" in str(exc).lower() or "sign in" in str(exc).lower():
+                break
+        except (asyncio.TimeoutError, OSError) as exc:
+            last = exc
+    if data is None:
+        raise last or LookupError("no results")
     if "entries" in data:
         entries = [e for e in data["entries"] if e]
         if not entries:
@@ -108,14 +146,16 @@ class GuildPlayer:
                     track.stream, track.fetched_at = fresh.stream, fresh.fetched_at
                 source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(track.stream, **FFMPEG_OPTS),
                                                       volume=self.volume)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Could not start playback of %r", track.title)
                 if self.text_channel:
-                    await self.text_channel.send(embed=ui.error(f"تعذّر تشغيل **{track.title}**، تم التخطي."))
+                    await ui.safe_send(self.text_channel, embed=ui.error(
+                        f"تعذّر تشغيل **{track.title}** وتم التخطي.\n{explain_error(exc)}"))
                 self.current = None
                 continue
             vc.play(source, after=lambda _e: self.cog.bot.loop.call_soon_threadsafe(self._next.set))
             if self.text_channel and not self.loop:
-                await self.text_channel.send(embed=self.now_playing_embed())
+                await ui.safe_send(self.text_channel, **await self.now_playing_message())
             await self._next.wait()
             if not self.loop:
                 self.current = None
@@ -124,6 +164,27 @@ class GuildPlayer:
         while not self.queue:
             await asyncio.sleep(1)
         return self.queue.popleft()
+
+    async def now_playing_message(self) -> dict:
+        """بطاقة «يعمل الآن» المصوّرة (غلاف الأغنية والمدة والصوت) وبديلها النصي عند أي فشل."""
+        t = self.current
+        s = await self.cog.bot.db.get_settings(self.guild.id)
+        if s["info_cards"] and cards.available():
+            try:
+                thumb = await images.fetch(t.thumbnail) if t.thumbnail else None
+                png = await asyncio.to_thread(
+                    cards.render_nowplaying, title=t.title, requester=t.requester.display_name, duration=t.length,
+                    thumbnail=thumb, queue_len=len(self.queue), volume=int(self.volume * 100), loop=self.loop,
+                    guild_name=self.guild.name)
+                kwargs: dict = {"file": ui.card_file(png, "nowplaying.png", f"يعمل الآن: {t.title}")}
+                e = ui.info(f"{ui.Icons.MUSIC} {t.title}"[:250], f"[رابط الأغنية]({t.url})", ui.Colors.MUSIC)
+                if s["game_image_in_embed"]:
+                    e.set_image(url="attachment://nowplaying.png")
+                kwargs["embed"] = e
+                return kwargs
+            except Exception:  # noqa: BLE001
+                log.exception("Now-playing card failed; using text embed")
+        return {"embed": self.now_playing_embed()}
 
     def now_playing_embed(self) -> discord.Embed:
         t = self.current
@@ -142,8 +203,8 @@ class GuildPlayer:
     async def destroy(self, message: Optional[str] = None):
         self.queue.clear()
         self.current = None
-        if self.voice:
-            await self.voice.disconnect(force=True)
+        if self.voice and await voice_home.home_channel(self.cog.bot, self.guild) is None:
+            await self.voice.disconnect(force=True)   # مع الاتصال الدائم يبقى البوت في روم المنزل
         if message and self.text_channel:
             try:
                 await self.text_channel.send(embed=ui.info(message, color=ui.Colors.LOG))
@@ -190,16 +251,27 @@ class Music(commands.Cog):
                        ephemeral=True)
         return False
 
-    @music.command(name="play", description="تشغيل أغنية بالاسم أو الرابط")
-    @app_commands.describe(query="اسم الأغنية أو رابط يوتيوب/ساوند كلاود")
-    async def play(self, interaction: discord.Interaction, query: app_commands.Range[str, 1, 300]):
-        if not interaction.user.voice or not interaction.user.voice.channel:
-            return await ui.reply(interaction, ui.error("ادخل روم صوتي أولًا."), ephemeral=True)
-        channel = interaction.user.voice.channel
+    async def _play(self, interaction: discord.Interaction, query: str):
+        home = await voice_home.home_channel(self.bot, interaction.guild)
+        user_ch = interaction.user.voice.channel if interaction.user.voice else None
+        if home is not None:
+            if user_ch is None or user_ch.id != home.id:
+                return await ui.reply(interaction, ui.error(
+                    f"البوت مثبّت في {home.mention} (اتصال دائم). ادخل هذا الروم ثم اطلب الأغنية."), ephemeral=True)
+            channel = home
+        else:
+            if user_ch is None:
+                return await ui.reply(interaction, ui.error("ادخل روم صوتي أولًا."), ephemeral=True)
+            channel = user_ch
         perms = channel.permissions_for(interaction.guild.me)
-        if not (perms.connect and perms.speak):
+        if not (perms.view_channel and perms.connect and perms.speak):
             return await ui.reply(interaction, ui.error("لا أملك صلاحية الدخول أو التحدث في هذا الروم."),
                                   ephemeral=True)
+        if shutil.which("ffmpeg") is None:
+            log.error("FFmpeg not found in PATH: music cannot play")
+            return await ui.reply(interaction, ui.error(
+                "FFmpeg غير مثبّت أو غير موجود في PATH على جهاز تشغيل البوت. ثبّته ثم أعد تشغيل البوت.",
+                "الموسيقى غير جاهزة"), ephemeral=True)
         vc = interaction.guild.voice_client
         if vc and vc.channel != channel:
             return await ui.reply(interaction, ui.error(f"البوت مشغول في {vc.channel.mention}."), ephemeral=True)
@@ -207,10 +279,23 @@ class Music(commands.Cog):
         await interaction.response.defer()
         try:
             track = await fetch_track(query, interaction.user)
-        except Exception:
-            return await interaction.followup.send(embed=ui.error("لم أجد نتيجة لهذا البحث أو الرابط غير مدعوم."))
-        if not vc:
-            await channel.connect(self_deaf=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Music search failed for %r: %s: %s", query, type(exc).__name__, str(exc)[:300])
+            return await interaction.followup.send(embed=ui.error(explain_error(exc), "تعذّر العثور على الأغنية"))
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            try:
+                if vc:
+                    await vc.disconnect(force=True)
+                await channel.connect(self_deaf=True, timeout=20.0, reconnect=True)
+            except asyncio.TimeoutError:
+                log.warning("Voice connect timed out in %s", channel.id)
+                return await interaction.followup.send(embed=ui.error(
+                    "انتهت مهلة الاتصال بالروم الصوتي. تأكد من صلاحيات البوت وحاول مجددًا.", "تعذّر الاتصال"))
+            except (discord.ClientException, discord.HTTPException) as exc:
+                log.exception("Voice connect failed")
+                return await interaction.followup.send(embed=ui.error(
+                    f"تعذّر الاتصال بالروم الصوتي ({type(exc).__name__}).", "تعذّر الاتصال"))
         player = self.get_player(interaction.guild)
         player.text_channel = interaction.channel
         if len(player.queue) >= 100:
@@ -225,6 +310,17 @@ class Music(commands.Cog):
             await interaction.followup.send(embed=e)
         else:
             await interaction.followup.send(embed=ui.info(f"🔎 جاري تشغيل **{track.title}**", color=ui.Colors.MUSIC))
+
+    @music.command(name="play", description="تشغيل أغنية بالاسم أو الرابط")
+    @app_commands.describe(query="اسم الأغنية أو رابط يوتيوب/ساوند كلاود")
+    async def play(self, interaction: discord.Interaction, query: app_commands.Range[str, 1, 300]):
+        await self._play(interaction, query)
+
+    @app_commands.command(name="play", description="تشغيل أغنية بالاسم أو الرابط (اختصار لـ /music play)")
+    @app_commands.describe(query="اسم الأغنية أو رابط يوتيوب/ساوند كلاود")
+    @app_commands.guild_only()
+    async def play_alias(self, interaction: discord.Interaction, query: app_commands.Range[str, 1, 300]):
+        await self._play(interaction, query)
 
     @music.command(name="skip", description="تخطي الأغنية الحالية")
     async def skip(self, interaction: discord.Interaction):
@@ -288,7 +384,8 @@ class Music(commands.Cog):
         player = self.players.get(interaction.guild_id)
         if not player or not player.current:
             return await ui.reply(interaction, ui.error("لا يوجد شيء يعمل."), ephemeral=True)
-        await ui.reply(interaction, player.now_playing_embed())
+        msg = await player.now_playing_message()
+        await ui.reply(interaction, msg["embed"], file=msg.get("file"))
 
     @music.command(name="volume", description="تغيير مستوى الصوت")
     async def volume(self, interaction: discord.Interaction, percent: app_commands.Range[int, 1, 150]):
@@ -333,6 +430,8 @@ class Music(commands.Cog):
             return
         if member.id == self.bot.user.id:
             return
+        if await voice_home.home_channel(self.bot, member.guild) is not None:
+            return   # اتصال دائم: لا يغادر عند خلو الروم
         if all(m.bot for m in vc.channel.members):
             await asyncio.sleep(60)
             vc = member.guild.voice_client

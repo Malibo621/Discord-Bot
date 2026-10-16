@@ -16,6 +16,7 @@ CHANNEL_KEYS = {
     "سجل الإدارة": "mod_log_channel",
     "سجل الاقتصاد": "economy_log_channel",
     "روم الألعاب": "games_channel",
+    "الصوت الدائم": "voice_home_channel",
 }
 
 
@@ -23,9 +24,11 @@ class Settings(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    settings = app_commands.Group(name="settings", description="إعدادات البوت (للمسؤولين)", guild_only=True)
+    _admins = discord.Permissions(administrator=True)  # تُخفي المجموعتين عن غير المسؤولين في قائمة ديسكورد
+    settings = app_commands.Group(name="settings", description="إعدادات البوت (للمسؤولين)", guild_only=True,
+                                  default_permissions=_admins)
     perms = app_commands.Group(name="permissions", description="تحديد الرتب المسموح لها بكل فئة أوامر",
-                               guild_only=True)
+                               guild_only=True, default_permissions=_admins)
 
     # ------------------------------------------------------------------ عرض
     @settings.command(name="view", description="عرض كل إعدادات البوت الحالية")
@@ -91,15 +94,24 @@ class Settings(commands.Cog):
                 for s in SETTINGS if current in s.label.lower() or current in s.key][:25]
 
     @settings.command(name="channel", description="تحديد رومات السجلات والألعاب")
-    @app_commands.describe(kind="نوع الروم", channel="الروم (اتركه فارغًا للإلغاء)")
+    @app_commands.describe(kind="نوع الروم (الصوت الدائم = روم يبقى فيه البوت 24/7)", channel="الروم (اتركه فارغًا للإلغاء)")
     @admin_only()
     async def channel(self, interaction: discord.Interaction,
-                      kind: Literal["السجل العام", "سجل الإدارة", "سجل الاقتصاد", "روم الألعاب"],
-                      channel: discord.TextChannel | None = None):
+                      kind: Literal["السجل العام", "سجل الإدارة", "سجل الاقتصاد", "روم الألعاب", "الصوت الدائم"],
+                      channel: discord.TextChannel | discord.VoiceChannel | discord.StageChannel | None = None):
         key = CHANNEL_KEYS[kind]
         if channel:
+            is_voice = isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+            if (key == "voice_home_channel") != is_voice:
+                return await ui.reply(interaction, ui.error(
+                    "«الصوت الدائم» يحتاج روم صوتيًا، وباقي الأنواع تحتاج روم نصيًا."), ephemeral=True)
             perms = channel.permissions_for(interaction.guild.me)
-            if not (perms.send_messages and perms.embed_links and perms.view_channel):
+            if is_voice:
+                if not (perms.view_channel and perms.connect and perms.speak):
+                    return await ui.reply(interaction, ui.error(
+                        f"لا أستطيع الاتصال والتحدث في {channel.mention}. امنحني صلاحيات العرض والاتصال والتحدث."),
+                        ephemeral=True)
+            elif not (perms.send_messages and perms.embed_links and perms.view_channel):
                 return await ui.reply(interaction, ui.error(f"لا أستطيع الإرسال في {channel.mention}. "
                                                             "تأكد من صلاحيات العرض والإرسال والتضمين."),
                                       ephemeral=True)

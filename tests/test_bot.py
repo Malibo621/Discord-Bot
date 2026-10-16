@@ -11,6 +11,7 @@ async def test_commands():
     bot = main.ServerBot()
     for cog in main.COGS:
         await bot.load_extension(cog)
+    bot.get_cog("VoiceHome").watchdog.cancel()
     cmds = bot.tree.get_commands()
     total = 0
     def check(c, depth=0):

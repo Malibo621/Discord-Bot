@@ -269,3 +269,101 @@ class Paginator(BaseView):
                 self.message = await interaction.original_response()
             except discord.HTTPException:
                 pass
+
+
+# ---------------------------------------------------------------------- البطاقات المصوّرة (إنفوجرافيك)
+def card_file(png: bytes, name: str, alt: str) -> discord.File:
+    import io
+    return discord.File(io.BytesIO(png), name, description=(alt or "")[:1000] or None)
+
+
+async def reply_card(interaction: discord.Interaction, png: bytes, name: str, alt: str, *, ephemeral: bool = False,
+                     view: Optional[discord.ui.View] = None, in_embed: bool = False,
+                     embed: Optional[discord.Embed] = None) -> None:
+    """يرسل بطاقة مصوّرة: مرفقًا مستقلًا (يُعرض أكبر في ديسكورد) أو داخل Embed حسب الإعداد."""
+    file = card_file(png, name, alt)
+    kwargs: dict = {"file": file, "ephemeral": ephemeral}
+    if view is not None:
+        kwargs["view"] = view
+    if in_embed:
+        embed = embed or discord.Embed(color=Colors.PRIMARY)
+        embed.set_image(url=f"attachment://{name}")
+    if embed is not None:
+        kwargs["embed"] = embed
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(**kwargs)
+        else:
+            await interaction.response.send_message(**kwargs)
+    except discord.NotFound:
+        log.debug("Interaction expired before card reply")
+
+
+class ImagePaginator(BaseView):
+    """تصفح صفحات مصوّرة: كل صفحة تُرسم عند الطلب (مرة واحدة) وتُخزَّن لتجنب إعادة التوليد."""
+
+    deny_message = "استخدم الأمر بنفسك لتتصفح."
+
+    def __init__(self, owner_id: int, pages: int, render, *, timeout: float = 180, in_embed: bool = False,
+                 name: str = "card.png"):
+        super().__init__(owner_id=owner_id, timeout=timeout)
+        self.pages, self.render, self.index = pages, render, 0   # render(index) -> (png bytes, alt text)
+        self.in_embed, self.name = in_embed, name
+        self._cache: dict[int, tuple[bytes, str]] = {}
+        self._sync()
+
+    def _sync(self):
+        self.prev.disabled = self.index == 0
+        self.next.disabled = self.index >= self.pages - 1
+        if self.pages <= 1:
+            self.clear_items()
+
+    async def page(self, index: int) -> tuple[bytes, str]:
+        if index not in self._cache:
+            self._cache[index] = await self.render(index)
+        return self._cache[index]
+
+    def _kwargs(self, png: bytes, alt: str) -> dict:
+        kw = {"attachments": [card_file(png, self.name, alt)], "view": self if self.pages > 1 else None}
+        if self.in_embed:
+            e = discord.Embed(color=Colors.PRIMARY)
+            e.set_image(url=f"attachment://{self.name}")
+            kw["embed"] = e
+        return kw
+
+    async def _go(self, interaction: discord.Interaction, delta: int):
+        self.index = max(0, min(self.pages - 1, self.index + delta))
+        self._sync()
+        await interaction.response.defer()
+        png, alt = await self.page(self.index)
+        await interaction.edit_original_response(**self._kwargs(png, alt))
+
+    @discord.ui.button(emoji="◀️", label="السابق", style=discord.ButtonStyle.secondary)
+    async def prev(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await self._go(interaction, -1)
+
+    @discord.ui.button(emoji="▶️", label="التالي", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await self._go(interaction, 1)
+
+    async def on_timeout(self):
+        await safe_edit(self.message, view=None)
+
+    async def start(self, interaction: discord.Interaction, *, ephemeral: bool = False) -> None:
+        png, alt = await self.page(0)
+        kwargs: dict = {"file": card_file(png, self.name, alt), "ephemeral": ephemeral}
+        if self.pages > 1:
+            kwargs["view"] = self
+        if self.in_embed:
+            e = discord.Embed(color=Colors.PRIMARY)
+            e.set_image(url=f"attachment://{self.name}")
+            kwargs["embed"] = e
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(**kwargs)
+            else:
+                await interaction.response.send_message(**kwargs)
+            if self.pages > 1:
+                self.message = await interaction.original_response()
+        except discord.NotFound:
+            pass

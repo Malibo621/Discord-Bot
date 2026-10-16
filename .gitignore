@@ -6,3 +6,5 @@ __pycache__/
 .installed-v2
 data/*.log
 data/.bot.pid
+data/.bot.lock
+data/backups/

@@ -1,6 +1,8 @@
 """نظام الاقتصاد: المحفظة، التحويل، الترتيب، سجل العمليات، وتحكّم الإدارة بالنقاط."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from typing import Optional
 
@@ -8,10 +10,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import ui
+from bot import cards, images, ui
 from bot.checks import has_category, require
 from bot.db import InsufficientFunds, LimitReached
 from bot.utils import earning_block_reason, ts
+
+log = logging.getLogger("bot.economy")
 
 TX_LABELS = {
     "game": ("🎮", "فوز في لعبة"),
@@ -81,6 +85,21 @@ class Economy(commands.Cog):
             return await ui.reply(interaction, ui.error("البوتات لا تملك محافظ."), ephemeral=True)
         s = await self.bot.db.get_settings(interaction.guild_id)
         w = await self.bot.db.wallet(interaction.guild_id, member.id)
+        if s["info_cards"] and cards.available():
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer()              # قراءة الأفاتار قد تتجاوز 3 ثوانٍ
+                png = await asyncio.to_thread(
+                    cards.render_balance, name=member.display_name, avatar=await images.avatar(member),
+                    currency=s["currency_name"], balance=w["balance"], rank=w["rank"],
+                    total_earned=w["total_earned"], games_won=w["games_won"], earned_today=w["earned_today"],
+                    daily_cap=s["daily_earn_cap"], guild_name=interaction.guild.name)
+                return await ui.reply_card(
+                    interaction, png, "balance.png",
+                    f"رصيد {member.display_name}: {w['balance']:,} {s['currency_name']}، الترتيب {w['rank']}",
+                    in_embed=s["game_image_in_embed"])
+            except Exception:  # noqa: BLE001 - فشل الرسم لا يعطّل الأمر: البديل النصي أدناه
+                log.exception("Balance card failed; using text fallback")
         e = ui.info(f"{s['currency_emoji']} محفظة {member.display_name}", color=ui.Colors.GOLD)
         e.set_thumbnail(url=member.display_avatar.url)
         e.add_field(name="💰 الرصيد", value=ui.money(w["balance"], s), inline=False)
@@ -173,8 +192,35 @@ class Economy(commands.Cog):
         if not total:
             return await ui.reply(interaction, ui.info(f"{ui.Icons.TROPHY} الترتيب",
                                                        "لا يوجد أحد في الترتيب بعد. العب وابدأ الجمع!"))
-        per_page = 10
+        w = await db.wallet(interaction.guild_id, interaction.user.id)
         rows = await db.leaderboard(interaction.guild_id, limit=min(total, 100))
+        if s["info_cards"] and cards.available():
+            try:
+                await interaction.response.defer()
+                pages = (len(rows) + 9) // 10
+                guild = interaction.guild
+
+                async def render(index: int):
+                    chunk = rows[index * 10:(index + 1) * 10]
+                    members = {r["user_id"]: guild.get_member(r["user_id"]) for r in chunk}
+                    avs = await asyncio.gather(*[images.avatar(m) if m else asyncio.sleep(0, None)
+                                                 for m in members.values()])
+                    png = await asyncio.to_thread(
+                        cards.render_leaderboard,
+                        rows=[dict(rank=index * 10 + i + 1, user_id=r["user_id"],
+                                   name=members[r["user_id"]].display_name if members[r["user_id"]] else f"عضو {r['user_id']}",
+                                   balance=r["balance"]) for i, r in enumerate(chunk)],
+                        avatars=dict(zip(members.keys(), avs)), viewer_id=interaction.user.id, viewer_rank=w["rank"],
+                        viewer_balance=w["balance"], currency=s["currency_name"], guild_name=guild.name,
+                        page=index + 1, pages=pages)
+                    return png, f"ترتيب {s['currency_name']} في {guild.name} — الصفحة {index + 1} من {pages}"
+
+                view = ui.ImagePaginator(interaction.user.id, pages, render, in_embed=s["game_image_in_embed"],
+                                         name="leaderboard.png")
+                return await view.start(interaction)
+            except Exception:  # noqa: BLE001
+                log.exception("Leaderboard card failed; using text fallback")
+        per_page = 10
         pages = []
         for start in range(0, len(rows), per_page):
             lines = []
@@ -186,7 +232,6 @@ class Economy(commands.Cog):
             if interaction.guild.icon:
                 e.set_thumbnail(url=interaction.guild.icon.url)
             pages.append(e)
-        w = await db.wallet(interaction.guild_id, interaction.user.id)
         for p in pages:
             p.add_field(name="ترتيبك", value=f"`#{w['rank']}` • {ui.money(w['balance'], s)}")
         await ui.Paginator(pages, interaction.user.id).start(interaction)
