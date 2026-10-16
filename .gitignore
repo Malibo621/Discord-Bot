@@ -1,0 +1,8 @@
+.env
+data/*.db*
+__pycache__/
+*.pyc
+.installed
+.installed-v2
+data/*.log
+data/.bot.pid

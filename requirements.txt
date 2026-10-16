@@ -1,0 +1,9 @@
+discord.py>=2.7.1
+davey
+PyNaCl>=1.5.0
+aiosqlite>=0.20.0
+yt-dlp>=2025.1.1
+python-dotenv>=1.0.0
+Pillow>=10.4
+arabic-reshaper>=3.0
+python-bidi>=0.4.2
