@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-from typing import Literal, Optional
+import time
+from dataclasses import dataclass
+from typing import Any, Literal, Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from bot import cards, images, ui
 from bot.checks import has_category, require
@@ -23,7 +25,10 @@ STATUS = {
     "pending": "🟡 بانتظار التسليم",
     "expired": "⚫ منتهي",
     "refunded": "↩️ مُسترجع",
+    "processing": "🔄 قيد التسليم",
+    "failed": "⚠️ فشل التسليم (لم يُخصم)",
 }
+MAX_RETRIES = 5
 
 
 def item_line(item, s) -> str:
@@ -88,23 +93,211 @@ async def refund_purchase(bot, guild: discord.Guild, admin: discord.Member, purc
     return True, f"أُعيد {ui.money(p['price'], s)} إلى <@{p['user_id']}>"
 
 
+@dataclass
+class PurchaseOutcome:
+    ok: bool
+    code: str                 # ok | not_found | no_role | no_perm | hierarchy | has_role | insufficient | limit | busy | role_failed
+    message: str
+    purchase_id: Optional[int] = None
+    before: int = 0
+    after: int = 0
+    row: Any = None
+    role: Optional[discord.Role] = None
+    retryable: bool = False
+
+
+def _role_problem(guild: discord.Guild, member: discord.Member, role: Optional[discord.Role]) -> Optional[tuple[str, str]]:
+    """فحوص منح الرتبة قبل أي خصم. يرجع (الرمز، الرسالة) أو None إن كان كل شيء سليمًا."""
+    if role is None:
+        return "no_role", "رتبة هذا المنتج حُذفت. تواصل مع الإدارة."
+    if not guild.me.guild_permissions.manage_roles:
+        return "no_perm", "البوت يفتقد صلاحية Manage Roles. أبلغ الإدارة."
+    if role.managed or role.is_default() or role >= guild.me.top_role:
+        return "hierarchy", "لا أستطيع منح هذه الرتبة لأنها أعلى من رتبة البوت (أو رتبة خاصة). أبلغ الإدارة."
+    if role in member.roles:
+        return "has_role", "تملك هذه الرتبة مسبقًا، فلا حاجة لشرائها."
+    return None
+
+
+async def _grant_and_verify(guild: discord.Guild, member: discord.Member, role: discord.Role, reason: str) -> Optional[str]:
+    """يمنح الرتبة ثم يتحقق فعليًا من وجودها عند العضو. يرجع None عند النجاح أو سبب الفشل."""
+    try:
+        await member.add_roles(role, reason=reason)
+    except discord.Forbidden:
+        return "ديسكورد رفض منح الرتبة (صلاحيات البوت أو ترتيب رتبته)"
+    except discord.HTTPException as exc:
+        return f"خطأ من ديسكورد ({exc.status})"
+    try:   # لا نعلن النجاح قبل التأكد أن الرتبة وصلت فعلًا
+        fresh = await guild.fetch_member(member.id)
+        if role not in fresh.roles:
+            return "لم تظهر الرتبة عند العضو بعد المنح"
+    except discord.HTTPException:
+        pass   # تعذّر التحقق (شبكة): نعتمد نجاح طلب المنح نفسه
+    return None
+
+
+async def complete_purchase(bot, guild: discord.Guild, member: discord.Member, item_id: int) -> PurchaseOutcome:
+    """الشراء الكامل بعد تأكيد العضو. الترتيب: فحوص ← خصم ذرّي ← منح الرتبة ← تأكيد أو عكس كامل ← إشعار الإدارة.
+
+    فشل منح الرتبة بعد الخصم يعكس الخصم والمخزون تلقائيًا في معاملة واحدة (فلا يُخصم شيء)، ويُسجَّل للتتبع،
+    ويبقى للعضو زر «إعادة المحاولة» دون أي دفع مكرر.
+    """
+    db = bot.db
+    busy: set = bot.__dict__.setdefault("_buying", set())
+    key = (guild.id, member.id, item_id)
+    if key in busy:
+        return PurchaseOutcome(False, "busy", "لديك عملية شراء لهذا المنتج قيد التنفيذ، انتظر لحظات.")
+    busy.add(key)
+    try:
+        row = await db.shop_item(guild.id, item_id)       # السعر والرتبة دائمًا من قاعدة البيانات لا من التفاعل
+        if not row or not row["active"] or row["deleted"]:
+            return PurchaseOutcome(False, "not_found", "المنتج غير موجود أو لم يعد معروضًا.")
+        role = None
+        if row["kind"] == "role":
+            role = guild.get_role(row["role_id"])
+            problem = _role_problem(guild, member, role)
+            if problem:
+                return PurchaseOutcome(False, problem[0], problem[1], row=row, role=role)
+        before = await db.balance(guild.id, member.id)
+        try:
+            purchase_id, after = await db.purchase(guild.id, member.id, item_id)
+        except InsufficientFunds:
+            return PurchaseOutcome(False, "insufficient", "رصيدك لا يكفي لإتمام الشراء.", before=before, row=row)
+        except LimitReached as exc:
+            return PurchaseOutcome(False, "limit", exc.message, before=before, row=row)
+
+        if role is not None:
+            failure = await _grant_and_verify(guild, member, role, f"شراء من المتجر #{purchase_id}")
+            if failure:
+                await db.settle_purchase(guild.id, purchase_id, ok=False, reason=failure)
+                log.warning("Role grant failed for purchase #%s (%s): %s", purchase_id, row["name"], failure)
+                await notify_purchase(bot, guild, member, row, purchase_id, before, before, role, failure=failure)
+                return PurchaseOutcome(False, "role_failed", f"تعذّر منح الرتبة: {failure}.\nلم يُخصم أي مبلغ من رصيدك.",
+                                       purchase_id, before, before, row, role, retryable=True)
+            await db.settle_purchase(guild.id, purchase_id, ok=True)
+        await notify_purchase(bot, guild, member, row, purchase_id, before, after, role)
+        return PurchaseOutcome(True, "ok", "", purchase_id, before, after, row, role)
+    finally:
+        busy.discard(key)
+
+
+async def notify_purchase(bot, guild: discord.Guild, member: discord.Member, row, purchase_id: int, before: int,
+                          after: int, role: Optional[discord.Role], *, failure: Optional[str] = None) -> None:
+    """إشعار إداري منسّق لكل عملية شراء (أو فشل تسليم) مع منشن رتبة الإدارة المضبوطة في الإعدادات."""
+    s = await bot.db.get_settings(guild.id)
+    channel = guild.get_channel(s["shop_notify_channel"]) if s["shop_notify_channel"] else None
+    if channel is None and s["economy_log_channel"]:
+        channel = guild.get_channel(s["economy_log_channel"])
+    if channel is None and s["log_channel"]:
+        channel = guild.get_channel(s["log_channel"])
+    if not isinstance(channel, discord.abc.Messageable):
+        return
+    ping = guild.get_role(s["shop_notify_role"]) if s["shop_notify_role"] else None
+    now_ts = int(time.time())
+    if failure:
+        e = ui.error(f"{member.mention} حاول شراء **{row['name']}** وتعذّر منح الرتبة.\n"
+                     f"السبب: {failure}\nلم يُخصم شيء (عُكست العملية تلقائيًا).", "⚠️ فشل تسليم رتبة")
+        status = f"🔴 فشل المنح — طلب `#{purchase_id}` معكوس"
+    else:
+        e = ui.info("🛒 عملية شراء جديدة", f"{member.mention} اشترى **{row['name']}**", ui.Colors.GOLD)
+        status = (f"🟢 مُنحت الرتبة {role.mention}" if role is not None else "🟡 بانتظار التسليم يدويًا")
+    price = row["price"]
+    e.add_field(name="👤 العضو", value=f"{member.mention}\n`{member.id}`")
+    e.add_field(name="📦 المنتج", value=f"`#{row['id']}` {row['name']}")
+    e.add_field(name="🏷️ الحالة", value=status)
+    e.add_field(name="💰 السعر", value=ui.money(price, s))
+    e.add_field(name="⬅️ الرصيد قبل", value=ui.money(before, s))
+    e.add_field(name="➖ المخصوم", value=ui.money(0 if failure else price, s))
+    e.add_field(name="➡️ الرصيد بعد", value=ui.money(after, s))
+    e.add_field(name="🕒 الوقت", value=f"<t:{now_ts}:F>\n<t:{now_ts}:R>")
+    e.add_field(name="🧾 رقم الطلب", value=f"`#{purchase_id}`")
+    e.set_thumbnail(url=member.display_avatar.url)
+    kwargs: dict = {"embed": e}
+    if ping is not None:   # منشن الرتبة المحددة فقط، لا أي شخص أو رتبة أخرى
+        kwargs["content"] = ping.mention
+        kwargs["allowed_mentions"] = discord.AllowedMentions(roles=[ping], users=False, everyone=False)
+    else:
+        kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+    try:
+        await channel.send(**kwargs)
+    except discord.HTTPException:
+        log.warning("Could not send purchase notification to #%s", getattr(channel, "name", "?"))
+
+
+async def recover_processing(bot) -> int:
+    """يُكمل أو يعكس مشتريات الرتب العالقة «قيد التسليم» (مثلًا بعد انهيار بين الخصم والمنح)."""
+    n = 0
+    for p in await bot.db.processing_purchases(90):
+        guild = bot.get_guild(p["guild_id"])
+        item = await bot.db.shop_item(p["guild_id"], p["item_id"])
+        member = guild.get_member(p["user_id"]) if guild else None
+        role = guild.get_role(item["role_id"]) if (guild and item) else None
+        if member is not None and role is not None and role in member.roles:
+            ok, reason = True, ""
+        elif member is not None and role is not None:
+            failure = await _grant_and_verify(guild, member, role, f"استكمال شراء #{p['id']}")
+            ok, reason = failure is None, failure or ""
+        else:
+            ok, reason = False, "العضو أو الرتبة غير متاحين"
+        if await bot.db.settle_purchase(p["guild_id"], p["id"], ok=ok, reason=reason or "استعادة تلقائية"):
+            await bot.db.note_attempt(p["guild_id"], p["user_id"], p["item_id"], p["id"],
+                                      "recovered" if ok else "reversed", reason or "استُكمل")
+            log.warning("Recovered stuck purchase #%s -> %s", p["id"], "delivered" if ok else f"reversed ({reason})")
+            n += 1
+    return n
+
+
+class RetryView(ui.BaseView):
+    """زر إعادة المحاولة بعد فشل منح الرتبة: لا دفع مكرر لأن الخصم عُكس تلقائيًا."""
+
+    deny_message = "هذه المحاولة تخص صاحب الطلب."
+
+    def __init__(self, bot, owner: discord.Member, guild: discord.Guild, item_id: int):
+        super().__init__(owner_id=owner.id, timeout=300)
+        self.bot, self.guild, self.owner, self.item_id, self.tries = bot, guild, owner, item_id, 0
+
+    @discord.ui.button(label="إعادة المحاولة", emoji="🔁", style=discord.ButtonStyle.primary)
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.tries += 1
+        member = self.guild.get_member(interaction.user.id) or interaction.user
+        out = await complete_purchase(self.bot, self.guild, member, self.item_id)
+        s = await self.bot.db.get_settings(self.guild.id)
+        if out.ok:
+            self.stop()
+            return await interaction.response.edit_message(embed=_success_embed(out, s), view=None)
+        if out.retryable and self.tries < MAX_RETRIES:
+            return await interaction.response.edit_message(embed=_failure_embed(out, retry_left=MAX_RETRIES - self.tries),
+                                                           view=self)
+        self.stop()
+        await interaction.response.edit_message(embed=_failure_embed(out), view=None)
+
+
+def _success_embed(out: PurchaseOutcome, s: dict) -> discord.Embed:
+    row = out.row
+    delivery = (f"تم منحك رتبة {out.role.mention}" if out.role is not None else "طلبك وصل للإدارة وسيتم تسليمه قريبًا.")
+    expires = None
+    return ui.success("تم الشراء بنجاح", f"**{row['name']}**\n{delivery}\n\n**رقم الطلب:** `#{out.purchase_id}`\n"
+                                         f"**رصيدك الآن:** {ui.money(out.after, s)}")
+
+
+def _failure_embed(out: PurchaseOutcome, retry_left: Optional[int] = None) -> discord.Embed:
+    e = ui.error(out.message, "تعذّر إتمام الشراء")
+    if out.retryable and retry_left is not None:
+        e.set_footer(text=f"المحاولات المتبقية: {retry_left}")
+    return e
+
+
 async def purchase_flow(bot, interaction: discord.Interaction, item_id: int) -> None:
-    """مسار الشراء الكامل (مشترك بين /buy وزر الشراء في المتجر): فحوص ← تأكيد ← خصم ذرّي ← تسليم."""
+    """واجهة الشراء (مشتركة بين /buy وزر الشراء): فحوص أولية ← تأكيد ← complete_purchase ← نتيجة صريحة."""
     db = bot.db
     s = await db.get_settings(interaction.guild_id)
     row = await db.shop_item(interaction.guild_id, item_id)
     if not row or not row["active"] or row["deleted"]:
         return await ui.reply(interaction, ui.error("المنتج غير موجود."), ephemeral=True)
-    role = None
     if row["kind"] == "role":
-        role = interaction.guild.get_role(row["role_id"])
-        if not role:
-            return await ui.reply(interaction, ui.error("رتبة هذا المنتج حُذفت. تواصل مع الإدارة."), ephemeral=True)
-        if role >= interaction.guild.me.top_role:
-            return await ui.reply(interaction, ui.error("لا أستطيع منح هذه الرتبة لأنها أعلى من رتبتي. "
-                                                        "تواصل مع الإدارة."), ephemeral=True)
-        if role in interaction.user.roles:
-            return await ui.reply(interaction, ui.error("تملك هذه الرتبة مسبقًا."), ephemeral=True)
+        problem = _role_problem(interaction.guild, interaction.user, interaction.guild.get_role(row["role_id"]))
+        if problem:
+            return await ui.reply(interaction, ui.error(problem[1]), ephemeral=True)
     bal = await db.balance(interaction.guild_id, interaction.user.id)
     if bal < row["price"]:
         return await ui.reply(interaction, ui.error(
@@ -123,39 +316,15 @@ async def purchase_flow(bot, interaction: discord.Interaction, item_id: int) -> 
             return await view.interaction.response.edit_message(embed=cancelled, view=None)
         return await interaction.edit_original_response(embed=cancelled, view=None)
 
-    try:   # الخصم والمخزون ومنع التكرار كلها داخل معاملة ذرّية واحدة في db.purchase
-        purchase_id, new_bal = await db.purchase(interaction.guild_id, interaction.user.id, item_id)
-    except InsufficientFunds:
-        return await view.interaction.response.edit_message(embed=ui.error("رصيدك لم يعد كافيًا."), view=None)
-    except LimitReached as exc:
-        return await view.interaction.response.edit_message(embed=ui.error(exc.message), view=None)
-
-    if role:
-        try:
-            await interaction.user.add_roles(role, reason=f"شراء من المتجر #{purchase_id}")
-        except discord.HTTPException:
-            await db.refund(interaction.guild_id, purchase_id, bot.user.id)
-            return await view.interaction.response.edit_message(
-                embed=ui.error("تعذّر منح الرتبة، وتمت إعادة نقاطك تلقائيًا."), view=None)
-        delivery = f"تم منحك رتبة {role.mention}"
-        row_p = await db.purchase_row(interaction.guild_id, purchase_id)
-        if row_p["expires_at"]:
-            delivery += f"، تنتهي {ts(row_p['expires_at'])}"
-    else:
-        delivery = "طلبك وصل للإدارة وسيتم تسليمه قريبًا."
-
-    done = ui.success("تم الشراء بنجاح", f"**{row['name']}**\n{delivery}\n\n**رقم الطلب:** `#{purchase_id}`\n"
-                                         f"**رصيدك الآن:** {ui.money(new_bal, s)}")
-    await view.interaction.response.edit_message(embed=done, view=None)
+    out = await complete_purchase(bot, interaction.guild, interaction.user, item_id)
+    if not out.ok:
+        retry = RetryView(bot, interaction.user, interaction.guild, item_id) if out.retryable else None
+        return await view.interaction.response.edit_message(embed=_failure_embed(out, MAX_RETRIES if retry else None),
+                                                            view=retry)
+    await view.interaction.response.edit_message(embed=_success_embed(out, s), view=None)
     await interaction.followup.send(embed=ui.brand(ui.info(
         f"{ui.Icons.SHOP} عملية شراء", f"{interaction.user.mention} اشترى **{row['name']}** 🎉",
         ui.Colors.GOLD), interaction.guild))
-    log_e = ui.info("🛒 عملية شراء" + (" — بانتظار التسليم" if not role else ""),
-                    f"**العضو:** {interaction.user.mention} (`{interaction.user.id}`)\n"
-                    f"**المنتج:** `#{row['id']}` {row['name']}\n**السعر:** `{row['price']:,}`\n"
-                    f"**رقم الطلب:** `#{purchase_id}`" + ("" if role else "\n\nللتسليم: `/shopadmin deliver`"),
-                    ui.Colors.WARNING if not role else ui.Colors.LOG)
-    await bot.send_log(interaction.guild, "economy", log_e)
 
 
 async def inventory_embed(bot, guild: discord.Guild, member: discord.Member) -> discord.Embed:
@@ -323,6 +492,23 @@ class Shop(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    async def cog_load(self):
+        self.recover_loop.start()
+
+    async def cog_unload(self):
+        self.recover_loop.cancel()
+
+    @tasks.loop(minutes=2)
+    async def recover_loop(self):
+        try:
+            await recover_processing(self.bot)
+        except Exception:  # noqa: BLE001 - لا نوقف المراقبة بسبب خطأ عابر
+            log.exception("recover_processing failed")
+
+    @recover_loop.before_loop
+    async def _before_recover(self):
+        await self.bot.wait_until_ready()
+
     async def item_autocomplete(self, interaction: discord.Interaction, current: str):
         items = await self.bot.db.shop_items(interaction.guild_id)
         s = await self.bot.db.get_settings(interaction.guild_id)
@@ -438,6 +624,19 @@ class Shop(commands.Cog):
 
     edit.autocomplete("item")(admin_item_autocomplete)
     remove.autocomplete("item")(admin_item_autocomplete)
+
+    @admin.command(name="failures", description="آخر محاولات الشراء الفاشلة أو المستعادة (تتبع إداري)")
+    @require("shop")
+    async def failures(self, interaction: discord.Interaction):
+        rows = await self.bot.db.purchase_attempts(interaction.guild_id)
+        if not rows:
+            return await ui.reply(interaction, ui.success("لا توجد إخفاقات", "كل عمليات الشراء مرّت بنجاح."),
+                                  ephemeral=True)
+        names = {"role_failed": "🔴 فشل منح الرتبة (عُكس)", "recovered": "🟢 استُكمل تلقائيًا", "reversed": "🟠 عُكس تلقائيًا"}
+        lines = [f"`#{r['purchase_id'] or '—'}` <@{r['user_id']}> — {names.get(r['outcome'], r['outcome'])}\n"
+                 f"└ {r['reason'] or ''} • <t:{r['created_at']}:R>" for r in rows]
+        await ui.reply(interaction, ui.info("🧾 محاولات الشراء المتعثرة", "\n".join(lines), ui.Colors.WARNING),
+                       ephemeral=True)
 
     @admin.command(name="pending", description="الطلبات بانتظار التسليم")
     @require("shop")

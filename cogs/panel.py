@@ -63,7 +63,7 @@ def _with_fallback(sections: list[Section]) -> list[Section]:
 SECTIONS = _with_fallback(_SECTIONS)
 SECTIONS_BY_KEY = {s.key: s for s in SECTIONS}
 PANEL_PERMS = {s.perm for s in SECTIONS}
-KIND_EMOJI = {"bool": "🔘", "int": "🔢", "str": "🔤", "channel": "#️⃣"}
+KIND_EMOJI = {"bool": "🔘", "int": "🔢", "str": "🔤", "channel": "#️⃣", "role": "🎖️"}
 PAGE = 25
 
 
@@ -74,7 +74,7 @@ def section_settings(section: Section) -> list[Setting]:
 def plain_value(st: Setting, value) -> str:
     if st.kind == "bool":
         return "مفعّل" if value else "معطّل"
-    if st.kind == "channel":
+    if st.kind in ("channel", "role"):
         return "محدد" if value else "غير محدد"
     if st.kind == "int":
         return f"{value:,}"
@@ -206,6 +206,13 @@ class PanelView(ui.BaseView):
             st = SETTINGS_BY_KEY[self.target]
             e.add_field(name="#️⃣ اختيار روم", value=f"اختر الروم الجديد لـ **{st.label}** من القائمة.", inline=False)
             self.add_item(ChannelPicker(st))
+            self.add_item(ActionButton("clear_channel", "إلغاء التحديد", "🧹", discord.ButtonStyle.danger, row=2))
+            self.add_item(ActionButton("back", "رجوع", "↩️", row=2))
+            return e
+        if self.mode == "role_setting" and self.target in SETTINGS_BY_KEY:
+            st = SETTINGS_BY_KEY[self.target]
+            e.add_field(name="🎖️ اختيار رتبة", value=f"اختر الرتبة الجديدة لـ **{st.label}** من القائمة.", inline=False)
+            self.add_item(RolePicker(max_values=1, placeholder=f"🎖️ {st.label}"[:100]))
             self.add_item(ActionButton("clear_channel", "إلغاء التحديد", "🧹", discord.ButtonStyle.danger, row=2))
             self.add_item(ActionButton("back", "رجوع", "↩️", row=2))
             return e
@@ -488,6 +495,9 @@ class SettingSelect(discord.ui.Select):
         if st.kind == "channel":
             view.mode, view.target = "channel", st.key
             return await view.refresh(interaction)
+        if st.kind == "role":
+            view.mode, view.target = "role_setting", st.key
+            return await view.refresh(interaction)
         await interaction.response.send_modal(SettingModal(view, st, current))
 
 
@@ -555,6 +565,14 @@ class RolePicker(discord.ui.RoleSelect):
             if problem:
                 return await view.refresh(interaction, (False, problem))
             return await interaction.response.send_modal(ItemModal(view, kind="role", role=role))
+        if view.mode == "role_setting":
+            st = SETTINGS_BY_KEY.get(view.target)
+            if st is None or st.kind != "role" or not await view.guard(interaction, SETTING_PERM):
+                return
+            role = roles[0] if roles else None
+            if role is None or role.is_default():
+                return await view.refresh(interaction, (False, "اختر رتبة صالحة (ليست @everyone)."))
+            return await view.save_setting(interaction, st, role.id)
         if view.mode == "perm_roles":
             if not await view.guard(interaction, ADMIN):
                 return

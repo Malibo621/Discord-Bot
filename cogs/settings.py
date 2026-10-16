@@ -17,6 +17,7 @@ CHANNEL_KEYS = {
     "سجل الاقتصاد": "economy_log_channel",
     "روم الألعاب": "games_channel",
     "الصوت الدائم": "voice_home_channel",
+    "إشعارات الشراء": "shop_notify_channel",
 }
 
 
@@ -68,7 +69,7 @@ class Settings(commands.Cog):
     def _parse(s, value: str, guild: discord.Guild):
         if s.kind == "channel":
             raise ValueError("استخدم `/settings channel` أو `/panel` لاختيار الروم.")
-        return parse_value(s, value)
+        return parse_value(s, value, lambda rid: guild.get_role(rid) is not None)
 
     @set_.autocomplete("key")
     async def key_autocomplete(self, _interaction: discord.Interaction, current: str):
@@ -97,7 +98,8 @@ class Settings(commands.Cog):
     @app_commands.describe(kind="نوع الروم (الصوت الدائم = روم يبقى فيه البوت 24/7)", channel="الروم (اتركه فارغًا للإلغاء)")
     @admin_only()
     async def channel(self, interaction: discord.Interaction,
-                      kind: Literal["السجل العام", "سجل الإدارة", "سجل الاقتصاد", "روم الألعاب", "الصوت الدائم"],
+                      kind: Literal["السجل العام", "سجل الإدارة", "سجل الاقتصاد", "روم الألعاب", "الصوت الدائم",
+                            "إشعارات الشراء"],
                       channel: discord.TextChannel | discord.VoiceChannel | discord.StageChannel | None = None):
         key = CHANNEL_KEYS[kind]
         if channel:

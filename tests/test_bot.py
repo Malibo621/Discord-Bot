@@ -12,6 +12,7 @@ async def test_commands():
     for cog in main.COGS:
         await bot.load_extension(cog)
     bot.get_cog("VoiceHome").watchdog.cancel()
+    bot.get_cog("Shop").recover_loop.cancel()
     cmds = bot.tree.get_commands()
     total = 0
     def check(c, depth=0):

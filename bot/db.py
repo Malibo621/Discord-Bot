@@ -117,6 +117,17 @@ CREATE TABLE IF NOT EXISTS command_shortcuts (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (guild_id, shortcut)
 );
+-- سجل محاولات الشراء الفاشلة/المستعادة للتتبع الإداري (لا يحتوي بيانات حساسة)
+CREATE TABLE IF NOT EXISTS purchase_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    purchase_id INTEGER,
+    outcome TEXT NOT NULL,        -- role_failed | recovered | reversed
+    reason TEXT,
+    created_at INTEGER NOT NULL
+);
 -- مفتاح فريد لكل جائزة لعبة: يمنع صرف الجائزة مرتين بسبب الضغط المتكرر أو التفاعلات المتزامنة
 CREATE TABLE IF NOT EXISTS reward_claims (
     claim_key TEXT PRIMARY KEY,
@@ -211,7 +222,7 @@ class Database:
             if not s:
                 continue
             raw = row["value"]
-            if s.kind in ("int", "channel"):
+            if s.kind in ("int", "channel", "role"):
                 values[s.key] = int(raw)
             elif s.kind == "bool":
                 values[s.key] = raw == "1"
@@ -551,7 +562,7 @@ class Database:
             if item["one_per_user"]:
                 async with conn.execute(
                     "SELECT 1 FROM purchases WHERE guild_id=? AND user_id=? AND item_id=? "
-                    "AND status IN ('delivered','pending')",
+                    "AND status IN ('delivered','pending','processing')",
                     (guild_id, user_id, item_id),
                 ) as cur:
                     if await cur.fetchone():
@@ -566,7 +577,7 @@ class Database:
             if item["stock"] > 0:
                 await conn.execute("UPDATE shop_items SET stock=stock-1 WHERE id=?", (item_id,))
             expires = now() + item["duration_hours"] * 3600 if item["duration_hours"] else None
-            status = "delivered" if item["kind"] == "role" else "pending"
+            status = "processing" if item["kind"] == "role" else "pending"   # الرتبة: delivered بعد منحها فعليًا
             cur = await conn.execute(
                 "INSERT INTO purchases (guild_id, user_id, item_id, item_name, price, status, expires_at, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -577,6 +588,56 @@ class Database:
             await self._log(conn, guild_id, user_id, -item["price"], "purchase",
                             f"#{purchase_id} {item['name']}", None, new)
             return purchase_id, new
+
+    async def settle_purchase(self, guild_id: int, purchase_id: int, *, ok: bool, reason: str = "") -> bool:
+        """يحسم شراءً «قيد التسليم»: نجاح ← delivered، فشل ← عكس ذرّي كامل (الرصيد والمخزون) وحالة failed.
+
+        يعمل مرة واحدة فقط لكل عملية (الشرط status='processing')، فلا يتكرر العكس مهما أُعيد استدعاؤه.
+        """
+        async with self.tx() as conn:
+            async with conn.execute(
+                "SELECT * FROM purchases WHERE guild_id=? AND id=? AND status='processing'",
+                (guild_id, purchase_id),
+            ) as cur:
+                p = await cur.fetchone()
+            if not p:
+                return False
+            if ok:
+                await conn.execute("UPDATE purchases SET status='delivered' WHERE id=?", (purchase_id,))
+                return True
+            await conn.execute("UPDATE purchases SET status='failed' WHERE id=?", (purchase_id,))
+            await self._ensure_wallet(conn, guild_id, p["user_id"])
+            await conn.execute(
+                "UPDATE wallets SET balance=balance+? WHERE guild_id=? AND user_id=?",
+                (p["price"], guild_id, p["user_id"]),
+            )
+            await conn.execute("UPDATE shop_items SET stock=stock+1 WHERE id=? AND stock>=0", (p["item_id"],))
+            new = await self._balance(conn, guild_id, p["user_id"])
+            await self._log(conn, guild_id, p["user_id"], p["price"], "purchase_reversal",
+                            f"#{purchase_id} {p['item_name']} — {reason or 'فشل التسليم'}", None, new)
+            await conn.execute(
+                "INSERT INTO purchase_attempts (guild_id, user_id, item_id, purchase_id, outcome, reason, created_at) "
+                "VALUES (?, ?, ?, ?, 'role_failed', ?, ?)",
+                (guild_id, p["user_id"], p["item_id"], purchase_id, reason[:200], now()),
+            )
+            return True
+
+    async def processing_purchases(self, older_than: int = 90):
+        """مشتريات رتب عالقة «قيد التسليم» (انهيار/انقطاع بين الخصم والمنح) لتُستكمل أو تُعكس."""
+        return await self.fetchall(
+            "SELECT * FROM purchases WHERE status='processing' AND created_at <= ? ORDER BY id LIMIT 50",
+            (now() - older_than,),
+        )
+
+    async def purchase_attempts(self, guild_id: int, limit: int = 15):
+        return await self.fetchall(
+            "SELECT * FROM purchase_attempts WHERE guild_id=? ORDER BY id DESC LIMIT ?", (guild_id, limit))
+
+    async def note_attempt(self, guild_id: int, user_id: int, item_id: int, purchase_id: Optional[int],
+                           outcome: str, reason: str) -> None:
+        await self.execute(
+            "INSERT INTO purchase_attempts (guild_id, user_id, item_id, purchase_id, outcome, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)", (guild_id, user_id, item_id, purchase_id, outcome, reason[:200], now()))
 
     async def refund(self, guild_id: int, purchase_id: int, admin_id: int) -> Optional[aiosqlite.Row]:
         async with self.tx() as conn:

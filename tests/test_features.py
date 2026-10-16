@@ -490,6 +490,7 @@ async def make_bot(db):
     for c in main.COGS:
         await bot.load_extension(c)
     bot.get_cog("VoiceHome").watchdog.cancel()   # لا اتصال حقيقي في الاختبارات
+    bot.get_cog("Shop").recover_loop.cancel()
     registry.apply_docs(bot.tree)
     return bot
 
@@ -1513,6 +1514,313 @@ def test_visual_sizes_16x9():
     print("OK visuals: game cards 1280x720 (16:9), roulette 960x540 PNG / ~16:9 GIF, 50 players")
 
 
+# ====================================================================== المتجر: شراء الرتب والإشعارات
+class FakeRole:
+    def __init__(self, rid, position=1, managed=False, default=False):
+        self.id, self.position, self.managed, self._default = rid, position, managed, default
+        self.mention, self.name = f"<@&{rid}>", f"role{rid}"
+
+    def is_default(self):
+        return self._default
+
+    def __ge__(self, other):
+        return self.position >= other.position
+
+    def __lt__(self, other):
+        return self.position < other.position
+
+
+def buyer(uid, balance_roles=()):
+    m = MagicMock(spec=discord.Member)
+    m.id, m.bot, m.mention, m.display_name = uid, False, f"<@{uid}>", f"user{uid}"
+    m.roles = list(balance_roles)
+    m.display_avatar = SimpleNamespace(url="https://example.com/a.png")
+    return m
+
+
+def shop_guild(top_position=10, manage_roles=True, roles=()):
+    g = MagicMock()
+    g.id, g.name = GUILD, "Test"
+    g.me = MagicMock()
+    g.me.top_role = FakeRole(0, top_position)
+    g.me.guild_permissions = discord.Permissions(manage_roles=manage_roles)
+    table = {r.id: r for r in roles}
+    g.get_role = lambda rid: table.get(rid)
+    notify = MagicMock(spec=discord.TextChannel)
+    notify.id, notify.name = 4242, "purchases"
+    notify.send = AsyncMock()
+    g.get_channel = lambda cid: notify if cid == 4242 else None
+    g.notify = notify
+    return g
+
+
+def grant_ok(member):
+    async def add_roles(*roles, reason=None):
+        member.roles.extend(roles)
+    member.add_roles = AsyncMock(side_effect=add_roles)
+
+
+def forbid(member):
+    member.add_roles = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403, reason="Forbidden"), "Missing Permissions"))
+
+
+async def test_shop_purchases():
+    from cogs import shop as sm
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            sm = sys.modules[type(bot.get_cog("Shop")).__module__]
+            role = FakeRole(555, 1)
+            guild = shop_guild(roles=[role, FakeRole(777, 99)])
+            ping = FakeRole(888, 1)
+            guild.get_role = (lambda table: lambda rid: table.get(rid))({555: role, 777: FakeRole(777, 99), 888: ping})
+            guild.fetch_member = AsyncMock()
+            bot.get_guild = lambda gid: guild
+            await db.set_setting(GUILD, "shop_notify_channel", 4242)
+            await db.set_setting(GUILD, "shop_notify_role", 888)
+            custom = await db.add_shop_item(GUILD, "Gift", "", 100, "custom", None, 3, 0, False)
+            rid = await db.add_shop_item(GUILD, "VIP", "", 250, "role", 555, -1, 0, True)
+            await db.admin_set(GUILD, 10, 1000, 1, "t")
+
+            def notice():
+                call = guild.notify.send.await_args
+                return call.kwargs
+
+            def fields(kw):
+                return {f.name: f.value for f in kw["embed"].fields}
+
+            # ---- منتج عادي: خصم مرة واحدة + إشعار بالقيم الصحيحة ومنشن الرتبة فقط
+            m10 = buyer(10)
+            out = await sm.complete_purchase(bot, guild, m10, custom)
+            assert out.ok and (out.before, out.after) == (1000, 900) and await db.balance(GUILD, 10) == 900
+            kw = notice()
+            f = fields(kw)
+            assert kw["content"] == "<@&888>" and kw["allowed_mentions"].roles == [ping] and not kw["allowed_mentions"].users
+            assert "1,000" in f["⬅️ الرصيد قبل"] and "100" in f["➖ المخصوم"] and "900" in f["➡️ الرصيد بعد"]
+            assert "Gift" in f["📦 المنتج"] and f"`#{out.purchase_id}`" == f["🧾 رقم الطلب"] and "<t:" in f["🕒 الوقت"]
+            assert "<@10>" in f["👤 العضو"] and "بانتظار" in f["🏷️ الحالة"]
+            assert (await db.purchase_row(GUILD, out.purchase_id))["status"] == "pending"
+
+            # ---- رتبة: تُمنح ثم delivered ثم إشعار «مُنحت»
+            grant_ok(m10)
+            guild.fetch_member = AsyncMock(return_value=m10)
+            out = await sm.complete_purchase(bot, guild, m10, rid)
+            assert out.ok and role in m10.roles and await db.balance(GUILD, 10) == 650
+            assert (await db.purchase_row(GUILD, out.purchase_id))["status"] == "delivered"
+            assert "مُنحت" in fields(notice())["🏷️ الحالة"]
+            # يملكها مسبقًا: لا خصم
+            out2 = await sm.complete_purchase(bot, guild, m10, rid)
+            assert not out2.ok and out2.code == "has_role" and await db.balance(GUILD, 10) == 650
+
+            # ---- فشل المنح: لا خصم، المخزون سليم، تتبع إداري، إشعار فشل، ثم إعادة محاولة ناجحة بدون دفع مكرر
+            await db.admin_set(GUILD, 11, 500, 1, "t")
+            m11 = buyer(11)
+            forbid(m11)
+            before_tx = len(await db.transactions(GUILD, 11))
+            out = await sm.complete_purchase(bot, guild, m11, rid)
+            assert not out.ok and out.code == "role_failed" and out.retryable and "لم يُخصم" in out.message
+            assert await db.balance(GUILD, 11) == 500
+            pr = await db.purchase_row(GUILD, out.purchase_id)
+            assert pr["status"] == "failed"
+            kinds = [r["kind"] for r in await db.transactions(GUILD, 11)]
+            assert kinds[:2] == ["purchase_reversal", "purchase"] and len(kinds) == before_tx + 2
+            att = await db.purchase_attempts(GUILD)
+            assert att and att[0]["outcome"] == "role_failed" and att[0]["user_id"] == 11
+            kw = notice()
+            assert "فشل" in kw["embed"].title and "<@&888>" == kw["content"]
+            assert "0" in fields(kw)["➖ المخصوم"] and "500" in fields(kw)["➡️ الرصيد بعد"]
+            # إعادة المحاولة عبر الزر
+            view = sm.RetryView(bot, m11, guild, rid)
+            inter = fake_interaction(m11)
+            inter.user = m11
+            guild.get_member = lambda uid: m11 if uid == 11 else None
+            await view.retry.callback(inter)                       # ما زال يفشل: يبقى الزر
+            assert inter.response.edit_message.await_args.kwargs["view"] is view and await db.balance(GUILD, 11) == 500
+            grant_ok(m11)
+            guild.fetch_member = AsyncMock(return_value=m11)
+            inter2 = fake_interaction(m11)
+            inter2.user = m11
+            await view.retry.callback(inter2)                      # بعد إصلاح الصلاحيات: ينجح ويُخصم مرة واحدة
+            assert inter2.response.edit_message.await_args.kwargs["view"] is None
+            assert await db.balance(GUILD, 11) == 250 and role in m11.roles
+            n_purchases = len([r for r in await db.fetchall("SELECT * FROM purchases WHERE user_id=11 AND item_id=?", (rid,))
+                               if r["status"] == "delivered"])
+            assert n_purchases == 1
+            # سقف إعادة المحاولة
+            await db.admin_set(GUILD, 12, 500, 1, "t")
+            m12 = buyer(12)
+            forbid(m12)
+            v2 = sm.RetryView(bot, m12, guild, rid)
+            guild.get_member = lambda uid: m12 if uid == 12 else None
+            for _ in range(sm.MAX_RETRIES):
+                i = fake_interaction(m12)
+                i.user = m12
+                await v2.retry.callback(i)
+            assert i.response.edit_message.await_args.kwargs["view"] is None and await db.balance(GUILD, 12) == 500
+
+            # ---- المنح «نجح» لكن الرتبة لم تظهر فعليًا عند العضو: يُعامل كفشل ويُعكس
+            await db.admin_set(GUILD, 13, 500, 1, "t")
+            m13 = buyer(13)
+            m13.add_roles = AsyncMock()                            # طلب ناجح لكن بلا أثر
+            guild.fetch_member = AsyncMock(return_value=buyer(13))
+            out = await sm.complete_purchase(bot, guild, m13, rid)
+            assert not out.ok and out.code == "role_failed" and await db.balance(GUILD, 13) == 500
+
+            # ---- فحوص ما قبل الخصم: لا تغيير في الرصيد في كل الحالات
+            await db.admin_set(GUILD, 14, 500, 1, "t")
+            m14 = buyer(14)
+            guild.me.guild_permissions = discord.Permissions(manage_roles=False)
+            out = await sm.complete_purchase(bot, guild, m14, rid)
+            assert out.code == "no_perm"
+            guild.me.guild_permissions = discord.Permissions(manage_roles=True)
+            high = await db.add_shop_item(GUILD, "Top", "", 10, "role", 777, -1, 0, True)
+            out = await sm.complete_purchase(bot, guild, m14, high)
+            assert out.code == "hierarchy"
+            gone = await db.add_shop_item(GUILD, "Gone", "", 10, "role", 123456, -1, 0, True)
+            assert (await sm.complete_purchase(bot, guild, m14, gone)).code == "no_role"
+            await db.admin_set(GUILD, 15, 5, 1, "t")
+            assert (await sm.complete_purchase(bot, guild, buyer(15), custom)).code == "insufficient"
+            assert (await sm.complete_purchase(bot, guild, m14, 99999)).code == "not_found"
+            await db.delete_shop_item(GUILD, custom)
+            assert (await sm.complete_purchase(bot, guild, m14, custom)).code == "not_found"
+            assert await db.balance(GUILD, 14) == 500 and await db.balance(GUILD, 15) == 5
+
+            # ---- سباقات: نفس العضو يضغط عشر مرات = شراء واحد؛ ومخزون 2 لعشرة أعضاء = شراءان
+            multi = await db.add_shop_item(GUILD, "Multi", "", 50, "custom", None, -1, 0, False)
+            await db.admin_set(GUILD, 20, 1000, 1, "t")
+            m20 = buyer(20)
+            res = await asyncio.gather(*[sm.complete_purchase(bot, guild, m20, multi) for _ in range(10)])
+            assert sum(1 for r in res if r.ok) == 1 and sum(1 for r in res if r.code == "busy") == 9
+            assert await db.balance(GUILD, 20) == 950
+            scarce = await db.add_shop_item(GUILD, "Scarce", "", 10, "custom", None, 2, 0, False)
+            users = list(range(30, 40))
+            for u in users:
+                await db.admin_set(GUILD, u, 100, 1, "t")
+            res = await asyncio.gather(*[sm.complete_purchase(bot, guild, buyer(u), scarce) for u in users])
+            assert sum(1 for r in res if r.ok) == 2
+            assert sum([100 - await db.balance(GUILD, u) for u in users]) == 20
+            assert (await db.shop_item(GUILD, scarce))["stock"] == 0
+            vip_once = await db.add_shop_item(GUILD, "Once", "", 20, "role", 555, -1, 0, True)
+            few = [buyer(u) for u in range(50, 58)]
+            for m in few:
+                grant_ok(m)
+                await db.admin_set(GUILD, m.id, 100, 1, "t")
+            # نفس العضو الواحد عبر قاعدة البيانات مباشرة (يتجاوز حارس الواجهة): one_per_user يمنع التكرار
+            res = await asyncio.gather(*[db.purchase(GUILD, 50, vip_once) for _ in range(6)], return_exceptions=True)
+            assert sum(1 for r in res if not isinstance(r, Exception)) == 1 and await db.balance(GUILD, 50) == 80
+
+            # ---- استعادة بعد انهيار بين الخصم والمنح
+            import time as _t
+            await db.admin_set(GUILD, 60, 400, 1, "t")
+            m60 = buyer(60)
+            grant_ok(m60)
+            guild.fetch_member = AsyncMock(return_value=m60)
+            guild.get_member = lambda uid: m60 if uid == 60 else None
+            pid, _ = await db.purchase(GUILD, 60, rid)               # يخصم ويبقى «processing»
+            assert (await db.purchase_row(GUILD, pid))["status"] == "processing" and await db.balance(GUILD, 60) == 150
+            assert await sm.recover_processing(bot) == 0             # حديث جدًا: لا يُمس
+            await db.execute("UPDATE purchases SET created_at=? WHERE id=?", (int(_t.time()) - 500, pid))
+            assert await sm.recover_processing(bot) == 1
+            assert (await db.purchase_row(GUILD, pid))["status"] == "delivered" and role in m60.roles
+            assert await sm.recover_processing(bot) == 0             # لا تكرار
+            await db.admin_set(GUILD, 61, 400, 1, "t")
+            m61 = buyer(61)
+            forbid(m61)
+            guild.get_member = lambda uid: m61 if uid == 61 else None
+            pid2, _ = await db.purchase(GUILD, 61, rid)
+            await db.execute("UPDATE purchases SET created_at=? WHERE id=?", (int(_t.time()) - 500, pid2))
+            assert await sm.recover_processing(bot) == 1
+            assert (await db.purchase_row(GUILD, pid2))["status"] == "failed" and await db.balance(GUILD, 61) == 400
+            await db.admin_set(GUILD, 62, 400, 1, "t")
+            pid3, _ = await db.purchase(GUILD, 62, rid)               # العضو غادر السيرفر
+            await db.execute("UPDATE purchases SET created_at=? WHERE id=?", (int(_t.time()) - 500, pid3))
+            guild.get_member = lambda uid: None
+            assert await sm.recover_processing(bot) == 1 and await db.balance(GUILD, 62) == 400
+            # عكس واحد فقط مهما تكرر الاستدعاء
+            assert not await db.settle_purchase(GUILD, pid3, ok=False, reason="x") and await db.balance(GUILD, 62) == 400
+
+            # ---- أمر متابعة الإخفاقات للإدارة
+            cog = bot.get_cog("Shop")
+            i = fake_interaction(fake_member(1, admin=True))
+            await cog.failures.callback(cog, i)
+            desc = i.response.send_message.await_args.kwargs["embed"].description
+            assert "role_failed" not in desc and "فشل منح الرتبة" in desc and "عُكس" in desc
+
+            # ---- بدون قناة إشعار: يرجع لقناة سجل الاقتصاد، وبدونهما لا ينهار
+            await db.reset_setting(GUILD, "shop_notify_channel")
+            await db.reset_setting(GUILD, "shop_notify_role")
+            guild.notify.send.reset_mock()
+            await sm.notify_purchase(bot, guild, m10, await db.shop_item(GUILD, rid), 1, 10, 5, role)
+            guild.notify.send.assert_not_awaited()                   # لا قناة محددة
+            await db.set_setting(GUILD, "economy_log_channel", 4242)
+            await sm.notify_purchase(bot, guild, m10, await db.shop_item(GUILD, rid), 1, 10, 5, role)
+            kw = guild.notify.send.await_args.kwargs
+            assert "content" not in kw and kw["allowed_mentions"].roles is False or not kw["allowed_mentions"].roles
+        finally:
+            await db.close()
+    print("OK shop purchases: charge-then-grant with full reversal on failure, retry w/o double charge, verified grant, "
+          "pre-checks, races, crash recovery, admin notice with exact balances and role-only ping")
+
+
+async def test_role_settings_in_panel():
+    from bot.settings_schema import SETTINGS_BY_KEY, format_value, parse_value
+    from cogs import panel as pm
+    st = SETTINGS_BY_KEY["shop_notify_role"]
+    assert st.kind == "role" and format_value(st, 0) == "`غير محددة`" and format_value(st, 5) == "<@&5>"
+    assert parse_value(st, "<@&123456>") == 123456 and parse_value(st, "123456") == 123456
+    for bad in ("", "abc"):
+        try:
+            parse_value(st, bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    try:
+        parse_value(st, "<@&9>", lambda rid: False)
+        raise AssertionError
+    except ValueError:
+        pass
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            admin = fake_member(1, admin=True)
+            view = pm.PanelView(bot, admin, MagicMock(id=GUILD))
+            view.section = pm.SECTIONS_BY_KEY["channels"]
+            sel = pm.SettingSelect([st], await db.get_settings(GUILD))
+            view.clear_items()
+            view.add_item(sel)
+            sel._values = ["shop_notify_role"]
+            await sel.callback(fake_interaction(admin))
+            assert view.mode == "role_setting" and view.target == "shop_notify_role"
+            await view.build(admin)
+            assert any(isinstance(c, pm.RolePicker) for c in view.children) and len(view.children) <= 25
+
+            async def choose(user, chosen):
+                """يعيد بناء اللوحة (كما يحدث فعليًا) ثم يحاكي اختيار الرتبة من القائمة."""
+                view.mode, view.target = "role_setting", "shop_notify_role"
+                await view.build(admin)
+                picker = next(c for c in view.children if isinstance(c, pm.RolePicker))
+                picker._values = [chosen]
+                i = fake_interaction(user)
+                i.guild.get_role = lambda rid: chosen
+                await picker.callback(i)
+
+            r = FakeRole(321, 1)
+            await choose(admin, FakeRole(1, 0, default=True))              # @everyone مرفوضة
+            assert (await db.get_settings(GUILD))["shop_notify_role"] == 0
+            await choose(admin, r)
+            assert (await db.get_settings(GUILD))["shop_notify_role"] == 321
+            await choose(fake_member(2), FakeRole(999, 1))                  # غير المسؤول لا يعدّل
+            assert (await db.get_settings(GUILD))["shop_notify_role"] == 321
+            view.mode, view.target = "role_setting", "shop_notify_role"     # الإلغاء
+            await view.on_action(fake_interaction(admin), "clear_channel")
+            assert (await db.get_settings(GUILD))["shop_notify_role"] == 0
+        finally:
+            await db.close()
+    print("OK role-type settings: parse/format, panel picker, @everyone blocked, non-admin blocked, clear")
+
+
 GUESSING = False
 test_game_logic()
 test_wheel()
@@ -1522,6 +1830,8 @@ asyncio.run(test_registry_and_storage())
 asyncio.run(test_shortcut_parsing_and_execution())
 asyncio.run(test_commands_panel())
 asyncio.run(test_shop_store_and_panel())
+asyncio.run(test_shop_purchases())
+asyncio.run(test_role_settings_in_panel())
 test_info_cards()
 asyncio.run(test_info_commands_use_cards_with_fallback())
 asyncio.run(test_fast_game_and_trigger())

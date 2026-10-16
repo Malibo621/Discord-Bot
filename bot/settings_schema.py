@@ -7,7 +7,7 @@ from typing import Any, Optional
 class Setting:
     key: str
     label: str
-    kind: str  # int | bool | str | channel
+    kind: str  # int | bool | str | channel | role
     default: Any
     group: str
     min: Optional[int] = None
@@ -25,6 +25,8 @@ SETTINGS: list[Setting] = [
     Setting("mod_log_channel", "روم سجل الإدارة", "channel", 0, "القنوات"),
     Setting("economy_log_channel", "روم سجل الاقتصاد", "channel", 0, "القنوات"),
     Setting("games_channel", "روم الألعاب (فارغ = كل الرومات)", "channel", 0, "القنوات"),
+    Setting("shop_notify_channel", "روم إشعارات الشراء للإدارة (فارغ = روم سجل الاقتصاد)", "channel", 0, "القنوات"),
+    Setting("shop_notify_role", "رتبة الإدارة التي تُمنشن عند كل عملية شراء", "role", 0, "القنوات"),
     Setting("voice_home_channel", "الروم الصوتي للاتصال الدائم 24/7 (فارغ = بدون)", "channel", 0, "القنوات"),
 
     # الألعاب: تفعيل/تعطيل ومدد كل لعبة
@@ -107,6 +109,8 @@ def format_value(setting: Setting, value: Any) -> str:
         return "🟢 مفعّل" if value else "🔴 معطّل"
     if setting.kind == "channel":
         return f"<#{value}>" if value else "`غير محدد`"
+    if setting.kind == "role":
+        return f"<@&{value}>" if value else "`غير محددة`"
     if setting.kind == "int":
         return f"`{value:,}`"
     return f"`{value}`"
@@ -129,6 +133,11 @@ def parse_value(setting: Setting, raw: str, channel_exists=None) -> Any:
         if (setting.min is not None and n < setting.min) or (setting.max is not None and n > setting.max):
             raise ValueError(f"القيمة يجب أن تكون بين **{setting.min:,}** و **{setting.max:,}**.")
         return n
+    if setting.kind == "role":
+        digits = "".join(c for c in value if c.isdigit())
+        if not digits or (channel_exists and not channel_exists(int(digits))):
+            raise ValueError("اختر الرتبة من القائمة.")
+        return int(digits)
     if setting.kind == "channel":
         digits = "".join(c for c in value if c.isdigit())
         if not digits or (channel_exists and not channel_exists(int(digits))):
