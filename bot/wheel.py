@@ -230,7 +230,7 @@ def _wheel(names: Sequence[str], dim_except: Optional[int] = None, muted: bool =
             label, size = _label_for_arc(raw, n)
             mid = -90 + (i + 0.5) * seg
             fill = WHITE if dim_except in (None, i) else (200, 200, 214)
-            t = _text_image(label, size * SS, fill=fill, stroke=(0, 0, 0, 170))
+            t = _text_image(label, size * SS, fill=fill, stroke=(0, 0, 0, 170 if dim_except in (None, i) else 70))
             rot = -mid
             if 90 < (mid % 360) < 270:
                 rot += 180
@@ -272,9 +272,9 @@ def _count_label(n: int) -> str:
 
 
 STATUS_STYLE = {
-    "waiting": ("بانتظار المشاركين", (43, 214, 123)),
-    "spinning": ("العجلة تدور…", (255, 181, 71)),
-    "result": ("الفائز", GOLD),
+    "waiting": ("بانتظار المشاركين", (18, 160, 98)),
+    "spinning": ("العجلة تدور…", (222, 122, 8)),
+    "result": ("الفائز", (236, 168, 28)),
 }
 
 
@@ -297,98 +297,135 @@ def _legend_for(names: Sequence[str], winner: Optional[int] = None) -> tuple:
     return tuple(rows), hidden
 
 
+INK = (14, 22, 44)
+INK2 = (76, 89, 117)
+INK3 = (128, 140, 166)
+LINE = (214, 221, 236)
+
+
+def _card(bg: Image.Image, box, radius=22, fill=(255, 255, 255, 255), outline=LINE + (255,), width=1, shadow=True):
+    """بطاقة بيضاء بظل ناعم (نفس لغة بطاقات canvas.py)."""
+    x0, y0, x1, y1 = [int(v) for v in box]
+    if shadow:
+        pad = 22
+        layer = Image.new("RGBA", (x1 - x0 + pad * 2, y1 - y0 + pad * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).rounded_rectangle((pad, pad + 4, layer.width - pad, layer.height - pad + 4), radius=radius,
+                                                fill=(26, 40, 84, 46))
+        bg.alpha_composite(layer.filter(ImageFilter.GaussianBlur(7)), (x0 - pad, y0 - pad))
+    _pill(bg, box, fill, outline, width) if radius * 2 >= (y1 - y0) else _round(bg, box, radius, fill, outline, width)
+
+
+def _round(img: Image.Image, box, radius, fill, outline=None, width=1):
+    x0, y0, x1, y1 = [int(v) for v in box]
+    pad, k = 2, 3
+    w, h = x1 - x0 + pad * 2, y1 - y0 + pad * 2
+    layer = Image.new("RGBA", (w * k, h * k), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle((pad * k, pad * k, (w - pad) * k - 1, (h - pad) * k - 1), radius=radius * k,
+                                            fill=fill, outline=outline, width=width * k)
+    img.alpha_composite(layer.resize((w, h), Image.LANCZOS), (x0 - pad, y0 - pad))
+
+
+@lru_cache(maxsize=1)
+def _page() -> Image.Image:
+    from . import canvas as cv
+    return cv.background("roulette").resize((CW, CH), Image.LANCZOS).convert("RGBA")
+
+
 @lru_cache(maxsize=24)
 def _scene(status: str, count: int, title: str, legend: tuple, hidden: int, winner_label: str,
            winner_number: int, logo: bytes = b"") -> Image.Image:
-    """الخلفية الثابتة: توهج، ظل، إطار معدني، قائمة المشاركين (يسار)، وبطاقة العنوان والحالة والفائز (يمين)."""
-    bg = Image.new("RGBA", (CW, CH), BG + (255,))
-    px = ImageDraw.Draw(bg)
-    for y in range(CH):
-        px.line((0, y, CW, y), fill=tuple(int(BG[i] + (24, 18, 44)[i] * (y / CH)) for i in range(3)) + (255,))
-    glow = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse((CX - R - 90, CY - R - 70, CX + R + 90, CY + R + 70), fill=BG_GLOW + (150,))
-    bg.alpha_composite(glow.filter(ImageFilter.GaussianBlur(52)))
+    """الخلفية الثابتة بلغة التصميم الموحّدة: صفحة فاتحة، إطار كحلي للعجلة، لوحة المشاركين (يسار)، والعنوان/الحالة/الفائز (يمين)."""
+    bg = _page().copy()
     shadow = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).ellipse((CX - R - 14, CY - R + 4, CX + R + 14, CY + R + 26), fill=(0, 0, 0, 170))
-    bg.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(14)))
+    ImageDraw.Draw(shadow).ellipse((CX - R - 12, CY - R + 8, CX + R + 12, CY + R + 30), fill=(26, 40, 84, 110))
+    bg.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(16)))
 
-    # الإطار المعدني (حلقة داكنة بحدّين ذهبيين وظل داخلي)
+    # الإطار المعدني (كحلي بحدّين ذهبيين)
     ring = Image.new("RGBA", (CW * SS, CH * SS), (0, 0, 0, 0))
     rd = ImageDraw.Draw(ring)
     c = (CX * SS, CY * SS)
-    for rad, fill in ((R + 26, GOLD_D), (R + 24, GOLD_L), (R + 21, RIM), (R + 1, (14, 12, 26))):
+    for rad, fill in ((R + 26, GOLD_D), (R + 24, GOLD_L), (R + 21, (26, 38, 82)), (R + 1, (12, 18, 40))):
         rd.ellipse((c[0] - rad * SS, c[1] - rad * SS, c[0] + rad * SS, c[1] + rad * SS), fill=fill + (255,))
     rd.ellipse((c[0] - (R + 8) * SS, c[1] - (R + 8) * SS, c[0] + (R + 8) * SS, c[1] + (R + 8) * SS),
-               outline=(255, 255, 255, 26), width=SS)
+               outline=(255, 255, 255, 30), width=SS)
     bg.alpha_composite(ring.resize((CW, CH), Image.LANCZOS))
 
     if not has_text_font():
         return bg
     text, col = STATUS_STYLE[status]
     side = 228
+    NOS = (0, 0, 0, 0)
 
     def put(img_text: Image.Image, x: float, y: float, anchor: str = "m"):
         """يضع صورة نص: anchor = m (وسط) | r (الحافة اليمنى عند x) | l (اليسرى)."""
         left = x - img_text.width / 2 if anchor == "m" else x - img_text.width if anchor == "r" else x
         bg.alpha_composite(img_text, (int(left), int(y - img_text.height / 2)))
 
+    def fit(txt, size, fill, max_w, min_size=12):
+        t = _text_image(txt, size, fill=fill, stroke=NOS)
+        while t.width > max_w and size > min_size:
+            size -= 1
+            t = _text_image(txt, size, fill=fill, stroke=NOS)
+        return t
+
     # ---- اللوحة اليمنى: العنوان + عدد المشاركين + الحالة + (الفائز)
     rx0, rx1 = CW - 24 - side, CW - 24
-    _pill(bg, (rx0, 22, rx1, 66), col + (46,), col + (190,))
+    _card(bg, (rx0, 22, rx1, 72), 22)
     badge = _brand.circle(logo, 34) if logo else None
+    tx_right = rx1 - 14
     if badge is not None:       # الشعار في موضع ثابت: يمين بطاقة العنوان
-        ImageDraw.Draw(bg).ellipse((rx1 - 42, 25, rx1 - 4, 63), outline=col + (230,), width=2)
-        bg.alpha_composite(badge, (rx1 - 40, 27))
-    put(_text_image(title, 30, fill=WHITE, stroke=(0, 0, 0, 120)), (rx0 + rx1) / 2 - (18 if badge is not None else 0), 44)
+        ImageDraw.Draw(bg).ellipse((rx1 - 46, 29, rx1 - 8, 67), outline=col + (255,), width=2)
+        bg.alpha_composite(badge, (rx1 - 44, 31))
+        tx_right = rx1 - 54
+    else:
+        _round(bg, (rx1 - 10, 32, rx1 - 6, 62), 2, col + (255,))
+        tx_right = rx1 - 22
+    put(fit(title, 28, INK, side - 70), tx_right, 47, "r")
     label = _count_label(count)
-    _pill(bg, (rx0, 78, rx1, 112), (255, 255, 255, 24), (255, 255, 255, 70))
-    put(_text_image(label, 20, fill=(214, 210, 236), stroke=(0, 0, 0, 90)), (rx0 + rx1) / 2, 95)
-    _pill(bg, (rx0, 124, rx1, 158), col + (34,), col + (170,))
-    ImageDraw.Draw(bg).ellipse((rx1 - 30, 135, rx1 - 16, 149), fill=col + (255,))
-    put(_text_image(text, 20, fill=WHITE, stroke=(0, 0, 0, 100)), (rx0 + rx1) / 2 - 8, 141)
+    _card(bg, (rx0, 84, rx1, 120), 18, shadow=False)
+    put(_text_image(label, 20, fill=INK2, stroke=NOS), (rx0 + rx1) / 2, 102)
+    _card(bg, (rx0, 130, rx1, 166), 18, fill=col + (30,), outline=col + (150,), shadow=False)
+    ImageDraw.Draw(bg).ellipse((rx1 - 30, 142, rx1 - 16, 156), fill=col + (255,))
+    put(_text_image(text, 20, fill=INK, stroke=NOS), (rx0 + rx1) / 2 - 8, 148)
     if status == "result" and winner_label:
-        _pill(bg, (rx0, 178, rx1, 330), (200, 140, 30, 60), GOLD_L + (230,), 2)
+        from . import canvas as cv
+        w_, h_ = side, 160
+        hero = cv._gradient(w_, h_, cv.NAVY0, cv.NAVY1).copy()
+        m = Image.new("L", (w_ * 3, h_ * 3), 0)
+        ImageDraw.Draw(m).rounded_rectangle((0, 0, w_ * 3 - 1, h_ * 3 - 1), radius=24 * 3, fill=255)
+        hero.putalpha(m.resize((w_, h_), Image.LANCZOS))
+        _card(bg, (rx0, 184, rx1, 184 + h_), 24, fill=(0, 0, 0, 0), outline=None, shadow=True)
+        bg.alpha_composite(hero, (rx0, 184))
         d = ImageDraw.Draw(bg)
-        ccx, ccy = (rx0 + rx1) / 2, 214
+        ccx, ccy = (rx0 + rx1) / 2, 222
         pts = [(ccx - 26, ccy + 12), (ccx - 26, ccy - 14), (ccx - 13, ccy - 2), (ccx, ccy - 18), (ccx + 13, ccy - 2),
                (ccx + 26, ccy - 14), (ccx + 26, ccy + 12)]
         d.polygon(pts, fill=GOLD_L + (255,), outline=GOLD_D + (255,))
         for qx, qy in ((ccx - 26, ccy - 14), (ccx, ccy - 18), (ccx + 26, ccy - 14)):
             d.ellipse((qx - 3, qy - 3, qx + 3, qy + 3), fill=WHITE + (255,))
-        size = 30
-        t = _text_image(winner_label, size, fill=WHITE, stroke=(70, 40, 0, 220))
-        while t.width > side - 28 and size > 14:
-            size -= 2
-            t = _text_image(winner_label, size, fill=WHITE, stroke=(70, 40, 0, 220))
-        put(t, (rx0 + rx1) / 2, 262)
+        put(fit(winner_label, 30, GOLD_L, side - 28, 14), (rx0 + rx1) / 2, 272)
         if winner_number:
-            put(_text_image(f"قطاع رقم {winner_number}", 17, fill=(255, 232, 160), stroke=(0, 0, 0, 90)),
-                (rx0 + rx1) / 2, 304)
+            put(_text_image(f"قطاع رقم {winner_number}", 17, fill=(176, 190, 226), stroke=NOS), (rx0 + rx1) / 2, 314)
+        else:
+            put(_text_image("الفائز بالجولة", 16, fill=(176, 190, 226), stroke=NOS), (rx0 + rx1) / 2, 314)
 
     # ---- اللوحة اليسرى: المشاركون بألوانهم
     lx0, lx1 = 24, 24 + side
-    _pill_box = (lx0, 22, lx1, CH - 24)
-    layer = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
-    ImageDraw.Draw(layer).rounded_rectangle(_pill_box, radius=22, fill=(27, 24, 50, 170), outline=col + (120,), width=2)
-    bg.alpha_composite(layer)
-    put(_text_image("المشاركون", 22, fill=WHITE, stroke=(0, 0, 0, 100)), (lx0 + lx1) / 2, 50)
+    _card(bg, (lx0, 22, lx1, CH - 24), 24)
+    put(_text_image("المشاركون", 22, fill=INK, stroke=NOS), (lx0 + lx1) / 2, 52)
+    ImageDraw.Draw(bg).line((lx0 + 22, 74, lx1 - 22, 74), fill=LINE + (255,), width=1)
     d = ImageDraw.Draw(bg)
-    y = 90
+    y = 98
     for text_, color, _idx, is_win in legend:
         if is_win:
-            _pill(bg, (lx0 + 10, y - 17, lx1 - 10, y + 17), GOLD + (60,), GOLD_L + (220,), 2)
-        d.ellipse((lx1 - 32, y - 8, lx1 - 16, y + 8), fill=color + (255,), outline=(255, 255, 255, 90), width=1)
-        size = 19
-        t = _text_image(text_, size, fill=WHITE, stroke=(0, 0, 0, 120))
-        while t.width > side - 70 and size > 12:
-            size -= 1
-            t = _text_image(text_, size, fill=WHITE, stroke=(0, 0, 0, 120))
-        put(t, lx1 - 42, y, "r")
+            _pill(bg, (lx0 + 10, y - 17, lx1 - 10, y + 17), GOLD + (46,), GOLD + (220,), 2)
+        d.ellipse((lx1 - 32, y - 8, lx1 - 16, y + 8), fill=color + (255,))
+        put(fit(text_, 19, INK, side - 70), lx1 - 42, y, "r")
         y += 34
     if hidden > 0:
-        put(_text_image(f"و {hidden} آخرين", 17, fill=(170, 166, 200), stroke=(0, 0, 0, 90)), (lx0 + lx1) / 2, y + 4)
+        put(_text_image(f"و {hidden} آخرين", 17, fill=INK3, stroke=NOS), (lx0 + lx1) / 2, y + 4)
     if not legend:
-        put(_text_image("لا مشاركين بعد", 18, fill=(170, 166, 200), stroke=(0, 0, 0, 90)), (lx0 + lx1) / 2, 140)
+        put(_text_image("لا مشاركين بعد", 18, fill=INK3, stroke=NOS), (lx0 + lx1) / 2, 140)
     return bg
 
 
@@ -402,7 +439,7 @@ def _bulbs(phase: int, all_on: bool) -> Image.Image:
         a = math.radians(-90 + i * 360 / BULBS)
         x, y = CX * SS + rr * math.cos(a), CY * SS + rr * math.sin(a)
         on = all_on or (i + phase) % 3 == 0
-        col = (255, 232, 160) if on else (96, 84, 132)
+        col = (255, 232, 160) if on else (84, 98, 150)
         d.ellipse((x - 4 * SS, y - 4 * SS, x + 4 * SS, y + 4 * SS), fill=col + (255,))
         if on:
             g.ellipse((x - 11 * SS, y - 11 * SS, x + 11 * SS, y + 11 * SS), fill=(255, 205, 100, 150))
