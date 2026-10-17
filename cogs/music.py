@@ -332,8 +332,8 @@ class GuildPlayer:
             try:
                 thumb = await images.fetch(t.thumbnail) if (t and t.thumbnail) else None
                 total = t.duration if t else 0
-                png = await asyncio.to_thread(
-                    cards.render_nowplaying, title=t.title if t else "", requester=t.requester.display_name if t else "",
+                png = await images.branded(
+                    self.guild, cards.render_nowplaying, title=t.title if t else "", requester=t.requester.display_name if t else "",
                     duration=t.length if t else "—", thumbnail=thumb, queue_len=len(self.queue),
                     volume=int(self.volume * 100), loop=self.loop, guild_name=self.guild.name,
                     artist=t.artist if t else None, artist_is_channel=t.by_channel if t else False,

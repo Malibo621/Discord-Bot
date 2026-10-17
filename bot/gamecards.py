@@ -49,7 +49,7 @@ def _timed(base_fn, theme: str, seconds: int, animate: bool) -> tuple[bytes, str
 
 
 def _panel(c: Canvas, box):
-    c.rr(box, 22, fill=PANEL + (236,), outline=c.theme.accent + (175,), width=2)
+    c.card(box, 22, fill=PANEL + (236,), outline=c.theme.accent + (175,), width=2)
 
 
 # ---------------------------------------------------------------------- الحساب السريع

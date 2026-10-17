@@ -90,8 +90,8 @@ class Economy(commands.Cog):
             try:
                 if not interaction.response.is_done():
                     await interaction.response.defer()              # قراءة الأفاتار قد تتجاوز 3 ثوانٍ
-                png = await asyncio.to_thread(
-                    cards.render_balance, name=member.display_name, avatar=await images.avatar(member),
+                png = await images.branded(
+                    interaction.guild, cards.render_balance, name=member.display_name, avatar=await images.avatar(member),
                     currency=s["currency_name"], balance=w["balance"], rank=w["rank"],
                     total_earned=w["total_earned"], games_won=w["games_won"], earned_today=w["earned_today"],
                     daily_cap=s["daily_earn_cap"], guild_name=interaction.guild.name)
@@ -206,8 +206,8 @@ class Economy(commands.Cog):
                     members = {r["user_id"]: guild.get_member(r["user_id"]) for r in chunk}
                     avs = await asyncio.gather(*[images.avatar(m) if m else asyncio.sleep(0, None)
                                                  for m in members.values()])
-                    png = await asyncio.to_thread(
-                        cards.render_leaderboard,
+                    png = await images.branded(
+                        guild, cards.render_leaderboard,
                         rows=[dict(rank=index * 10 + i + 1, user_id=r["user_id"],
                                    name=members[r["user_id"]].display_name if members[r["user_id"]] else f"عضو {r['user_id']}",
                                    balance=r["balance"]) for i, r in enumerate(chunk)],

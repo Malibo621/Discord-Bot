@@ -376,8 +376,8 @@ async def render_store(bot, guild: discord.Guild, member: discord.Member, page: 
             urls = {r["id"]: r["image_url"] for r in chunk if r["image_url"]}
             fetched = await asyncio.gather(*[images.fetch(u) for u in urls.values()])
             imgs = dict(zip(urls.keys(), fetched))
-            png = await asyncio.to_thread(
-                cards.render_store, items=[dict(id=r["id"], name=r["name"], price=r["price"], kind=r["kind"],
+            png = await images.branded(
+                guild, cards.render_store, items=[dict(id=r["id"], name=r["name"], price=r["price"], kind=r["kind"],
                                                 stock=r["stock"], duration_hours=r["duration_hours"]) for r in chunk],
                 images=imgs, balance=bal, currency=s["currency_name"], guild_name=guild.name, page=page + 1,
                 pages=pages)

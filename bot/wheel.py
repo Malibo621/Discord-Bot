@@ -19,14 +19,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Sequence
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
-try:  # تشكيل الحروف العربية (Pillow على ويندوز غالبًا بدون raqm)
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-except ImportError:  # pragma: no cover - تعمل العجلة بالأرقام فقط
-    arabic_reshaper = None
-    get_display = None
+from . import brand as _brand, fonts
 
 # ---------------------------------------------------------------------- الهوية البصرية
 CW, CH = 960, 540          # أبعاد الصورة النهائية (16:9)
@@ -57,20 +52,6 @@ HOLD_MS = 600_000          # آخر إطار يبقى 10 دقائق (حد صيغ
 MAX_GIF_BYTES = 5_500_000  # حد آمن لرفع ديسكورد (الافتراضي 8MB) وسرعة التحميل على الجوال
 GIF_SCALE = 0.8            # الـ GIF أصغر قليلًا من PNG: ديسكورد يعرض الصورة المضمّنة بعرض ~400px أصلًا
 
-FONT_CANDIDATES = [
-    os.getenv("BOT_FONT_PATH", ""),
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "font.ttf"),
-    "C:/Windows/Fonts/tahomabd.ttf",
-    "C:/Windows/Fonts/segoeuib.ttf",
-    "C:/Windows/Fonts/arialbd.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    "/System/Library/Fonts/Supplemental/Tahoma Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    "/Library/Fonts/Arial Unicode.ttf",
-]
 
 
 # ---------------------------------------------------------------------- منطق النتيجة
@@ -118,31 +99,15 @@ def spin_curve(frames: int, accel: float = 0.12) -> list[float]:
     return [cum[round(i * (samples - 1) / (frames - 1))] for i in range(frames)]
 
 
-# ---------------------------------------------------------------------- النصوص
-@lru_cache(maxsize=None)
-def _font_path() -> Optional[str]:
-    for path in FONT_CANDIDATES:
-        if path and os.path.isfile(path):
-            return path
-    return None
-
-
-@lru_cache(maxsize=64)
-def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    path = _font_path()
-    if path:
-        return ImageFont.truetype(path, size)
-    return ImageFont.load_default(size)
-
-
+# ---------------------------------------------------------------------- النصوص (عبر نظام الخطوط الموحّد)
 def has_text_font() -> bool:
-    return _font_path() is not None and arabic_reshaper is not None
+    return fonts.available()
 
 
 def clean_name(name: str, limit: int = 14) -> str:
-    """يحذف الإيموجي والرموز التي لا يدعمها الخط، ويقص الاسم الطويل."""
+    """يحذف الإيموجي والرموز غير المدعومة ويقص الاسم الطويل (يُستخدم قبل الرسم لتقدير العرض بدقة)."""
     kept = "".join(c for c in name if (unicodedata.category(c)[0] in "LNPMZ"
-                                       or unicodedata.category(c) in ("Sc", "Sm")) and unicodedata.category(c) != "Cf")
+                                      or unicodedata.category(c) in ("Sc", "Sm")) and unicodedata.category(c) != "Cf")
     kept = " ".join(kept.split())
     if len(kept) > limit:
         kept = kept[: limit - 1].rstrip() + "…"
@@ -150,21 +115,11 @@ def clean_name(name: str, limit: int = 14) -> str:
 
 
 def shape(text: str) -> str:
-    if arabic_reshaper and any("\u0600" <= c <= "\u06ff" for c in text):
-        return get_display(arabic_reshaper.reshape(text))
-    return text
+    return fonts.shape(text)
 
 
 def _text_image(text: str, size: int, fill=WHITE, stroke=(0, 0, 0, 140)) -> Image.Image:
-    font = _font(size)
-    text = shape(text)
-    sw = max(1, size // 9)
-    bbox = font.getbbox(text, stroke_width=sw)
-    w, h = bbox[2] - bbox[0] + 4, bbox[3] - bbox[1] + 4
-    img = Image.new("RGBA", (max(1, w), max(1, h)), (0, 0, 0, 0))
-    ImageDraw.Draw(img).text((2 - bbox[0], 2 - bbox[1]), text, font=font, fill=fill,
-                             stroke_width=sw, stroke_fill=stroke)
-    return img
+    return fonts.render(text, size, fill, stroke)
 
 
 # ---------------------------------------------------------------------- الرسم
@@ -202,7 +157,7 @@ def _pill(img: Image.Image, box, fill, outline=None, width=2):
 
 
 def _tw(text: str, size: int) -> int:
-    return int(_font(size).getlength(shape(text)))
+    return int(fonts.measure(text, size))
 
 
 def _label_for_arc(label: str, n: int) -> tuple[str, int]:
@@ -344,7 +299,7 @@ def _legend_for(names: Sequence[str], winner: Optional[int] = None) -> tuple:
 
 @lru_cache(maxsize=24)
 def _scene(status: str, count: int, title: str, legend: tuple, hidden: int, winner_label: str,
-           winner_number: int) -> Image.Image:
+           winner_number: int, logo: bytes = b"") -> Image.Image:
     """الخلفية الثابتة: توهج، ظل، إطار معدني، قائمة المشاركين (يسار)، وبطاقة العنوان والحالة والفائز (يمين)."""
     bg = Image.new("RGBA", (CW, CH), BG + (255,))
     px = ImageDraw.Draw(bg)
@@ -380,7 +335,11 @@ def _scene(status: str, count: int, title: str, legend: tuple, hidden: int, winn
     # ---- اللوحة اليمنى: العنوان + عدد المشاركين + الحالة + (الفائز)
     rx0, rx1 = CW - 24 - side, CW - 24
     _pill(bg, (rx0, 22, rx1, 66), col + (46,), col + (190,))
-    put(_text_image(title, 30, fill=WHITE, stroke=(0, 0, 0, 120)), (rx0 + rx1) / 2, 44)
+    badge = _brand.circle(logo, 34) if logo else None
+    if badge is not None:       # الشعار في موضع ثابت: يمين بطاقة العنوان
+        ImageDraw.Draw(bg).ellipse((rx1 - 42, 25, rx1 - 4, 63), outline=col + (230,), width=2)
+        bg.alpha_composite(badge, (rx1 - 40, 27))
+    put(_text_image(title, 30, fill=WHITE, stroke=(0, 0, 0, 120)), (rx0 + rx1) / 2 - (18 if badge is not None else 0), 44)
     label = _count_label(count)
     _pill(bg, (rx0, 78, rx1, 112), (255, 255, 255, 24), (255, 255, 255, 70))
     put(_text_image(label, 20, fill=(214, 210, 236), stroke=(0, 0, 0, 90)), (rx0 + rx1) / 2, 95)
@@ -510,7 +469,8 @@ def _frame(status: str, count: int, title: str, wheel: Image.Image, angle: float
            wheel_b: Optional[Image.Image] = None, mix: float = 0.0) -> Image.Image:
     legend, hidden = _legend_for(names, winner if status == "result" else None)
     number = (winner + 1) if (status == "result" and winner is not None and len(names) > NAMED_MAX) else 0
-    frame = _scene(status, count, title, legend, hidden, winner_label if status == "result" else "", number).copy()
+    frame = _scene(status, count, title, legend, hidden, winner_label if status == "result" else "", number,
+                   _brand.current() or b"").copy()
     base = wheel if wheel_b is None or mix <= 0 else Image.blend(wheel, wheel_b, mix)
     rot = base.rotate(-angle, resample=Image.BICUBIC)
     if blur > 12:  # طمس حركي خفيف جدًا عند السرعة العالية فقط (الأسماء غير مقروءة وقتها أصلًا)

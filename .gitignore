@@ -8,3 +8,4 @@ data/*.log
 data/.bot.pid
 data/.bot.lock
 data/backups/
+assets/fonts/

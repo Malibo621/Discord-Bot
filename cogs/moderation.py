@@ -160,8 +160,8 @@ class Moderation(commands.Cog):
                     chunk = rows[index * 4:(index + 1) * 4]
                     items = [dict(id=w["id"], date=datetime.fromtimestamp(w["created_at"], timezone.utc).strftime("%Y-%m-%d"),
                                   mod=mod_name(w["mod_id"]), reason=w["reason"], status=w["status"]) for w in chunk]
-                    png = await asyncio.to_thread(
-                        cards.render_warnings, name=member.display_name, avatar=avatar, active=active, revoked=revoked,
+                    png = await images.branded(
+                        guild, cards.render_warnings, name=member.display_name, avatar=avatar, active=active, revoked=revoked,
                         stage=stage_label(active) if active else "لا إنذارات نشطة", items=items, page=index + 1,
                         pages=pages, guild_name=guild.name)
                     return png, f"سجل تحذيرات {member.display_name}: {active} نشطة و{revoked} ملغاة"

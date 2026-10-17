@@ -17,7 +17,7 @@ from typing import Optional, Sequence
 
 from PIL import Image, ImageDraw, ImageFilter
 
-from .wheel import _font, has_text_font, shape
+from . import brand as _brand, fonts
 
 SCALE = 2
 LW, LH = 640, 360
@@ -76,20 +76,21 @@ def px(v: float) -> int:
     return int(round(v * SCALE))
 
 
-def text_width(text: str, size: float) -> float:
-    return _font(px(size)).getlength(shape(text)) / SCALE
+def text_width(text: str, size: float, weight: str = fonts.BOLD) -> float:
+    return fonts.measure(text, px(size), weight) / SCALE
 
 
-def fit_text(text: str, size: float, max_w: float, min_size: float = 10, ellipsis: bool = True) -> tuple[str, float]:
+def fit_text(text: str, size: float, max_w: float, min_size: float = 10, ellipsis: bool = True,
+             weight: str = fonts.BOLD) -> tuple[str, float]:
     """يصغّر الخط حتى يتسع النص في max_w، ثم يقصّ الكلمات الأخيرة بـ «…» إن لزم."""
-    while size > min_size and text_width(text, size) > max_w:
+    while size > min_size and text_width(text, size, weight) > max_w:
         size -= 1
-    if ellipsis and text_width(text, size) > max_w:
+    if ellipsis and text_width(text, size, weight) > max_w:
         words = text.split()
-        while len(words) > 1 and text_width(" ".join(words) + "…", size) > max_w:
+        while len(words) > 1 and text_width(" ".join(words) + "…", size, weight) > max_w:
             words.pop()
         text = " ".join(words) + "…"
-        while len(text) > 2 and text_width(text, size) > max_w:
+        while len(text) > 2 and text_width(text, size, weight) > max_w:
             text = text[:-2].rstrip() + "…"
     return text, size
 
@@ -145,6 +146,7 @@ class Canvas:
     def __init__(self, theme: str):
         self.theme = THEMES[theme]
         self.img = background(theme).copy()
+        self.brand = _brand.current()       # شعار السيرفر (إن وُجد) من سياق الرسم
 
     # ---- أشكال
     @staticmethod
@@ -162,6 +164,19 @@ class Canvas:
 
     def rr(self, box, radius, fill=None, outline=None, width=1.0):
         self._rr_on(self.img, box, radius, fill, outline, width)
+
+    def card(self, box, radius, fill=None, outline=None, width=1.0, shadow: bool = True):
+        """لوحة رئيسية بظل ناعم وخط إضاءة علوي خفيف (هوية موحّدة لكل البطاقات)."""
+        x0, y0, x1, y1 = box
+        if shadow:
+            pad = px(14)
+            w, h = px(x1 - x0) + pad * 2, px(y1 - y0) + pad * 2
+            layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            ImageDraw.Draw(layer).rounded_rectangle((pad, pad + px(3), w - pad, h - pad + px(3)), radius=px(radius),
+                                                    fill=(0, 0, 0, 120))
+            self.img.alpha_composite(layer.filter(ImageFilter.GaussianBlur(px(5))), (px(x0) - pad, px(y0) - pad))
+        self.rr(box, radius, fill, outline, width)
+        self.line((x0 + radius, y0 + 1.5), (x1 - radius, y0 + 1.5), (255, 255, 255, 30), 1)
 
     def pill(self, box, fill=None, outline=None, width=1.0):
         self.rr(box, (box[3] - box[1]) / 2, fill, outline, width)
@@ -187,17 +202,18 @@ class Canvas:
 
     # ---- نصوص
     def text(self, text: str, x: float, y: float, size: float, fill=WHITE, anchor: str = "mm",
-             max_w: Optional[float] = None, shadow: bool = True) -> float:
+             max_w: Optional[float] = None, shadow: bool = True, weight: Optional[str] = None) -> float:
+        """نص بنظام الخطوط الموحّد (DIN-like + عربي) مع ظل. الوزن تلقائي: خافت للنصوص الثانوية وعريض لغيرها."""
         if not text:
             return size
+        if weight is None:
+            weight = fonts.MEDIUM if tuple(fill[:3]) in (MUTED, SOFT) else fonts.BOLD
         if max_w:
-            text, size = fit_text(text, size, max_w)
-        shaped = shape(text)
-        font = _font(px(size))
+            text, size = fit_text(text, size, max_w, weight=weight)
         d = ImageDraw.Draw(self.img)
         if shadow:
-            d.text((px(x) + 2, px(y) + 3), shaped, font=font, fill=SHADOW, anchor=anchor)
-        d.text((px(x), px(y)), shaped, font=font, fill=fill, anchor=anchor)
+            fonts.draw(d, (px(x) + 2, px(y) + 3), text, px(size), SHADOW, anchor=anchor, weight=weight)
+        fonts.draw(d, (px(x), px(y)), text, px(size), fill, anchor=anchor, weight=weight)
         return size
 
     def wrap(self, text: str, size: float, max_w: float, max_lines: int = 3) -> list[str]:
@@ -222,9 +238,15 @@ class Canvas:
         """الشريط العلوي: عنوان القسم (يمين)، الجائزة/معلومة (يسار)، وشارة وسطى."""
         t = self.theme
         label = (title or t.title) + ("  ·  فعالية" if event else "")
+        right = LW - 18
+        logo = _brand.circle(self.brand, px(26)) if self.brand else None
+        if logo is not None:
+            self.circle(right - 13, 27, 16, None, t.accent + (230,), 1.5)
+            self.img.alpha_composite(logo, (px(right - 13) - logo.width // 2, px(27) - logo.height // 2))
+            right -= 38
         tw = text_width(label, 15) + 22
-        self.pill((LW - 18 - tw, 14, LW - 18, 40), t.accent + (60,), t.accent + (200,), 1)
-        self.text(label, LW - 18 - tw / 2, 27, 15, WHITE, shadow=False)
+        self.pill((right - tw, 14, right, 40), t.accent + (60,), t.accent + (200,), 1)
+        self.text(label, right - tw / 2, 27, 15, WHITE, shadow=False)
         if reward:
             rw = text_width(reward, 15) + 44
             self.pill((18, 14, 18 + rw, 40), GOLD + (40,), GOLD + (210,), 1)
@@ -260,8 +282,7 @@ class Canvas:
                 av = None
         if av is None:
             av = Image.new("RGBA", (size, size), self.theme.accent + (255,))
-            ImageDraw.Draw(av).text((size // 2, size // 2), shape(fallback[:1] or "?"), font=_font(int(size * 0.5)),
-                                    fill=WHITE, anchor="mm")
+            fonts.draw(ImageDraw.Draw(av), (size // 2, size // 2), fallback[:1] or "?", size * 0.5, WHITE, anchor="mm")
         mask = Image.new("L", (size * 3, size * 3), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, size * 3 - 1, size * 3 - 1), fill=255)
         av.putalpha(mask.resize((size, size), Image.LANCZOS))
@@ -315,4 +336,4 @@ def gif_bytes(frames: Sequence[Image.Image], durations: Sequence[int]) -> bytes:
 
 
 def available() -> bool:
-    return has_text_font()
+    return fonts.available()

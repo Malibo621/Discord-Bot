@@ -26,7 +26,7 @@ from bot.checks import has_category, require
 from bot.game_data import QUESTIONS, WORDS
 from bot.game_logic import (GuessState, make_math_problem, parse_number, quiz_options, scramble,
                             scramble_hint)
-from bot import answers as ans, registry
+from bot import answers as ans, images, registry
 from bot.shortcuts import TextInteraction
 from bot.utils import earning_block_reason, has_invisible, normalize, obfuscate
 from bot import gamecards, wheel
@@ -198,8 +198,8 @@ class Games(commands.Cog):
             except Exception:  # noqa: BLE001 - الأفاتار تحسين بصري فقط
                 avatar = None
         try:
-            return await asyncio.to_thread(
-                gamecards.render_result, ctx.game, wheel.clean_name(headline, 18) or "الفائز", details,
+            return await images.branded(
+                ctx.starter.guild, gamecards.render_result, ctx.game, wheel.clean_name(headline, 18) or "الفائز", details,
                 winner=winner is not None, avatar=avatar, reward=self._reward_label(ctx, s),
                 animate=s["game_animations"], event=ctx.is_event)
         except Exception:  # noqa: BLE001
@@ -226,7 +226,7 @@ class Games(commands.Cog):
         if not ctx.visual:
             return None
         try:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            return await images.branded(ctx.starter.guild, fn, *args, **kwargs)
         except Exception:  # noqa: BLE001
             ui.log.exception("Game card render failed")
             ctx.visual = False
@@ -697,7 +697,7 @@ class Games(commands.Cog):
             return e
 
         async def refresh_image():
-            png = await asyncio.to_thread(wheel.render_lobby, [m.display_name for m in lobby.players])
+            png = await images.branded(interaction.guild, wheel.render_lobby, [m.display_name for m in lobby.players])
             await ui.safe_edit(ctx.message, embed=lobby_embed(),
                                attachments=[discord.File(io.BytesIO(png), "wheel.png")])
 
@@ -705,7 +705,7 @@ class Games(commands.Cog):
         lobby.refresh_image = refresh_image if can_attach else None
         file = None
         if can_attach:
-            png = await asyncio.to_thread(wheel.render_lobby, [])
+            png = await images.branded(interaction.guild, wheel.render_lobby, [])
             file = discord.File(io.BytesIO(png), "wheel.png")
         await self._send_card(interaction, ctx, lobby_embed(), view=lobby, file=file)
         await lobby.wait()
@@ -740,7 +740,7 @@ class Games(commands.Cog):
         spin_wait = 1.5
         files = []
         if can_attach and s["game_animations"]:   # تقليل الحركة: بدون GIF تُعرض النتيجة مباشرة
-            spin = await asyncio.to_thread(wheel.render_spin, names, win_idx, angle)
+            spin = await images.branded(interaction.guild, wheel.render_spin, names, win_idx, angle)
             if s["game_image_in_embed"]:
                 spin_embed.set_image(url="attachment://spin.gif")
             files = [discord.File(io.BytesIO(spin.gif), "spin.gif")]
@@ -760,7 +760,7 @@ class Games(commands.Cog):
         result.set_footer(text=f"🎡 الروليت  ·  {'إقصاء' if elimination else 'عجلة الحظ'}")
         files = []
         if can_attach:
-            png = await asyncio.to_thread(wheel.render_result, names, win_idx, angle)
+            png = await images.branded(interaction.guild, wheel.render_result, names, win_idx, angle)
             if s["game_image_in_embed"]:
                 result.set_image(url="attachment://result.png")
             files = [discord.File(io.BytesIO(png), "result.png")]
@@ -801,7 +801,7 @@ class Games(commands.Cog):
                         ui.Colors.GAME)
             files = []
             if can_attach:
-                png = await asyncio.to_thread(wheel.render_result, names, idx, angle)
+                png = await images.branded(interaction.guild, wheel.render_result, names, idx, angle)
                 if s["game_image_in_embed"]:
                     e.set_image(url="attachment://round.png")
                 files = [discord.File(io.BytesIO(png), "round.png")]

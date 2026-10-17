@@ -2518,6 +2518,77 @@ async def test_music_rapid_requests_and_errors():
           "give clear messages, full queue refused")
 
 
+def test_fonts_unified():
+    import glob
+    import shutil
+    from bot import canvas as cv, fonts
+    assert fonts.available() and fonts.chain(fonts.BOLD) and fonts.chain(fonts.MEDIUM)
+    vocab = ["ابتثجحخدذرزسشصضطظعغفقكلمنهوىيءأإآؤئة", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+             "0123456789 ٠١٢٣٤٥٦٧٨٩", "×÷+=.,:;!?()-/%#", "الحساب السريع المتصدرون المتجر الموسيقى الإنذار الثاني"]
+    for text in vocab:
+        assert fonts.missing(text) == [], (text, fonts.missing(text))
+    assert fonts.missing("\U0001F525") == ["\U0001F525"]
+    assert fonts.measure("\U0001F525 Ali", 40) == fonts.measure(" Ali", 40)
+    assert fonts.render("Ali محمد 123", 40).getbbox() is not None
+    assert abs(cv.text_width("Test 123", 20) * cv.SCALE - fonts.measure("Test 123", 40)) < 1e-6
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bad = []
+    for path in glob.glob(os.path.join(root, "bot", "*.py")) + glob.glob(os.path.join(root, "cogs", "*.py")):
+        if os.path.basename(path) != "fonts.py" and "ImageFont.truetype" in open(path, encoding="utf-8").read():
+            bad.append(os.path.basename(path))
+    assert not bad, bad
+    src = next((f.path for f in fonts.chain(fonts.BOLD) if not f.variation), None)
+    if src:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            mine = os.path.join(d, "DIN-Test-Bold.ttf")
+            shutil.copy(src, mine)
+            os.environ["BOT_FONT_DIR"] = d
+            fonts.reload()
+            try:
+                assert fonts.chain(fonts.BOLD)[0].path == mine
+                assert fonts.render("اختبار Test", 30).getbbox() is not None
+            finally:
+                os.environ.pop("BOT_FONT_DIR", None)
+                fonts.reload()
+        assert "DIN-Test" not in fonts.fingerprint()
+    print("OK fonts: single stack, full coverage, emoji dropped, mixed scripts, assets/fonts override, no direct loading")
+
+
+def test_brand_logo():
+    import io as _io
+    from PIL import Image, ImageChops, ImageDraw
+    from bot import brand, gamecards as gc, wheel as wh
+
+    def logo():
+        im = Image.new("RGB", (64, 64), (200, 40, 40))
+        ImageDraw.Draw(im).ellipse((12, 12, 52, 52), fill=(255, 255, 255))
+        b = _io.BytesIO()
+        im.save(b, "PNG")
+        return b.getvalue()
+
+    def shot():
+        return Image.open(_io.BytesIO(gc.render_math("1 + 1", 10, "5", animate=False)[0])).convert("RGB")
+
+    base = shot()
+    tok = brand.BRAND.set(logo())
+    try:
+        with_logo = shot()
+        wheel_logo = Image.open(_io.BytesIO(wh.render_lobby(["a", "b", "c"]))).convert("RGB")
+    finally:
+        brand.BRAND.reset(tok)
+    assert ImageChops.difference(base, with_logo).getbbox() is not None
+    tok = brand.BRAND.set(b"junk")
+    try:
+        junk = shot()
+    finally:
+        brand.BRAND.reset(tok)
+    assert ImageChops.difference(base, junk).getbbox() is None
+    plain = Image.open(_io.BytesIO(wh.render_lobby(["a", "b", "c"]))).convert("RGB")
+    assert ImageChops.difference(plain, wheel_logo).getbbox() is not None
+    assert brand.current() is None
+    print("OK brand: logo drawn in cards and roulette, corrupt logo ignored, context restored")
+
+
 def test_music_card():
     from PIL import Image
     from bot import cards
@@ -2566,4 +2637,6 @@ asyncio.run(test_roulette_flow())
 asyncio.run(test_permissions())
 asyncio.run(test_reward_idempotency())
 asyncio.run(test_panel_security_and_layout())
+test_fonts_unified()
+test_brand_logo()
 print("ALL FEATURE TESTS PASSED")

@@ -75,7 +75,7 @@ def render_balance(*, name: str, avatar: Optional[bytes], currency: str, balance
                    games_won: int, earned_today: int, daily_cap: int, guild_name: str) -> bytes:
     c = Canvas("balance")
     c.header(None, False, None, title=f"محفظة {name_of(name, 18)}")
-    c.rr((22, 52, LW - 22, 214), 24, fill=PANEL + (232,), outline=GOLD + (170,), width=2)
+    c.card((22, 52, LW - 22, 214), 24, fill=PANEL + (232,), outline=GOLD + (170,), width=2)
     c.avatar(avatar, LW - 22 - 28 - 52, 133, 100, GOLD, name)
     nx = LW - 22 - 28 - 52 - 74
     c.text(name_of(name, 22), nx, 100, 28, WHITE, anchor="rm", max_w=330)
@@ -108,7 +108,7 @@ def render_profile(*, name: str, tag: str, avatar: Optional[bytes], balance: int
                    top_role: str, guild_name: str) -> bytes:
     c = Canvas("profile")
     c.header(None, False, top_role and name_of(top_role, 16) or None, title="الملف الشخصي")
-    c.rr((22, 52, LW - 22, 186), 24, fill=PANEL + (232,), outline=c.theme.accent + (170,), width=2)
+    c.card((22, 52, LW - 22, 186), 24, fill=PANEL + (232,), outline=c.theme.accent + (170,), width=2)
     c.avatar(avatar, LW - 22 - 28 - 48, 119, 92, c.theme.accent, name)
     nx = LW - 22 - 28 - 48 - 66
     c.text(name_of(name, 22), nx, 98, 30, WHITE, anchor="rm", max_w=380)
@@ -190,7 +190,7 @@ def render_store(*, items: Sequence[dict], images: dict[int, Optional[bytes]], b
         x0, y0 = x1 - tw, 52 + r * (th + gy)
         sold = it["stock"] == 0
         affordable = balance >= it["price"]
-        c.rr((x0, y0, x1, y0 + th), 16, fill=PANEL + (232,),
+        c.card((x0, y0, x1, y0 + th), 16, fill=PANEL + (232,),
              outline=(RED if sold else (t.accent if affordable else MUTED)) + (190,), width=1.6)
         # منطقة الصورة
         ih = th * 0.44
@@ -245,7 +245,7 @@ def render_nowplaying(*, title: str, requester: str, duration: str, thumbnail: O
     c = Canvas("music")
     t = c.theme
     c.header(None, False, "متوقف مؤقتًا" if paused else ("لا شيء يعمل" if idle else status))
-    c.rr((22, 52, LW - 22, 338), 24, fill=PANEL + (232,), outline=(AMBER if paused else t.accent) + (170,), width=2)
+    c.card((22, 52, LW - 22, 338), 24, fill=PANEL + (232,), outline=(AMBER if paused else t.accent) + (170,), width=2)
     box = (34, 66, 34 + 240, 66 + 135)
     im = _cover(thumbnail, px(box[2] - box[0]), px(box[3] - box[1])) if thumbnail and not idle else None
     if im is not None:
@@ -301,7 +301,7 @@ def render_warnings(*, name: str, avatar: Optional[bytes], active: int, revoked:
     c = Canvas("warnings")
     col = STAGE_COLORS.get(min(active, 3), RED)
     c.header(None, False, f"صفحة {page} من {pages}", title="سجل التحذيرات")
-    c.rr((22, 52, LW - 22, 130), 20, fill=PANEL + (232,), outline=col + (190,), width=2)
+    c.card((22, 52, LW - 22, 130), 20, fill=PANEL + (232,), outline=col + (190,), width=2)
     c.avatar(avatar, LW - 22 - 24 - 28, 91, 56, col, name)
     nx = LW - 22 - 24 - 56 - 14
     c.text(name_of(name, 22), nx, 77, 24, WHITE, anchor="rm", max_w=250)

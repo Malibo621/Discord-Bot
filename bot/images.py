@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import io
 import ipaddress
 import logging
@@ -18,6 +20,8 @@ from urllib.parse import urlparse
 
 import aiohttp
 from PIL import Image
+
+from .brand import BRAND
 
 log = logging.getLogger("bot.images")
 
@@ -121,3 +125,37 @@ async def avatar(user, size: int = 128) -> Optional[bytes]:
     while len(_avatar_cache) > 256:
         _avatar_cache.popitem(last=False)
     return data
+
+
+_guild_icons: "OrderedDict[tuple, tuple[float, Optional[bytes]]]" = OrderedDict()
+
+
+async def guild_icon(guild) -> Optional[bytes]:
+    """شعار السيرفر (64px) مع تخزين مؤقت ساعة؛ None إن لم يوجد أو تعذّر تحميله."""
+    icon = getattr(guild, "icon", None)
+    key = getattr(icon, "key", None)
+    if not isinstance(key, str):
+        return None
+    ck = (getattr(guild, "id", 0), key)
+    hit = _guild_icons.get(ck)
+    if hit and time.monotonic() - hit[0] < 3600:
+        return hit[1]
+    try:
+        data = await asyncio.wait_for(icon.with_size(64).read(), timeout=5)
+        if not isinstance(data, (bytes, bytearray)):
+            data = None
+    except Exception:  # noqa: BLE001
+        data = None
+    _guild_icons[ck] = (time.monotonic(), bytes(data) if data else None)
+    while len(_guild_icons) > 16:
+        _guild_icons.popitem(last=False)
+    return _guild_icons[ck][1]
+
+
+async def branded(guild, fn, *args, **kwargs):
+    """يشغّل دالة الرسم في خيط منفصل مع شعار السيرفر في سياقها (فيظهر في موضعه الثابت في كل الصور)."""
+    icon = await guild_icon(guild) if guild is not None else None
+    ctx = contextvars.copy_context()
+    ctx.run(BRAND.set, icon)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(ctx.run, functools.partial(fn, *args, **kwargs)))

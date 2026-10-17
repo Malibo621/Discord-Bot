@@ -107,8 +107,8 @@ class Info(commands.Cog):
                 if not interaction.response.is_done():
                     await interaction.response.defer()
                 top = next((r for r in reversed(m.roles) if not r.is_default()), None)
-                png = await asyncio.to_thread(
-                    cards.render_profile, name=m.display_name, tag=f"@{m.name}", avatar=await images.avatar(m),
+                png = await images.branded(
+                    interaction.guild, cards.render_profile, name=m.display_name, tag=f"@{m.name}", avatar=await images.avatar(m),
                     balance=w["balance"], currency=s["currency_name"], rank=w["rank"], games_won=w["games_won"],
                     total_earned=w["total_earned"], warnings=warns, roles=max(0, len(m.roles) - 1),
                     joined=m.joined_at.strftime("%Y-%m-%d") if m.joined_at else "—",
