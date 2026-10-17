@@ -37,6 +37,10 @@ AMBER = (255, 181, 71)
 BLUE = (79, 163, 255)
 VIOLET = (124, 92, 255)
 SHADOW = (0, 0, 0, 120)
+INK = (17, 27, 51)            # لون النص الأساسي على الخلفية الفاتحة
+INK2 = (96, 108, 134)         # نص ثانوي
+GOLD_INK = (168, 106, 0)      # ذهبي داكن للنص (يُقرأ على الأبيض)
+LINE = (150, 162, 186)
 HOLD_MS = 600_000          # آخر إطار GIF يبقى 10 دقائق (حد صيغة GIF ~10.9 دقيقة)
 MAX_GIF_FRAMES = 24
 
@@ -72,6 +76,36 @@ def mix(a, b, t):
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
+def tone_text(fill) -> tuple:
+    """يحوّل ألوان النص المصمّمة للخلفية الداكنة إلى ما يقابلها على الخلفية الفاتحة (يقرأ بوضوح)."""
+    rgb = tuple(fill[:3])
+    a = fill[3] if len(fill) > 3 else 255
+    if rgb == WHITE:
+        return (INK if a >= 200 else INK2) + (255,)
+    if rgb in (MUTED, SOFT):
+        return INK2 + (255,)
+    if min(rgb) > 215:
+        return INK + (255,)
+    if rgb[0] > 200 and rgb[2] < 190 and rgb[0] - rgb[2] > 60 and rgb[1] > 150:
+        return GOLD_INK + (a,)
+    if (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) / 255 > 0.5:
+        return mix(rgb, (0, 0, 0), 0.42) + (a,)
+    return rgb + (a,)
+
+
+def tone_shape(c):
+    """ألوان الأشكال: اللوحة الداكنة تصبح بيضاء، والطبقات البيضاء الشفافة طبقات زرقاء رمادية خفيفة."""
+    if c is None:
+        return None
+    rgb = tuple(c[:3])
+    a = c[3] if len(c) > 3 else 255
+    if rgb == PANEL:
+        return (255, 255, 255, 255 if a >= 200 else a)
+    if rgb == WHITE and a < 255:
+        return (24, 44, 84, min(255, int(a * 1.1) + 8))
+    return rgb + (a,)
+
+
 def px(v: float) -> int:
     return int(round(v * SCALE))
 
@@ -97,46 +131,29 @@ def fit_text(text: str, size: float, max_w: float, min_size: float = 10, ellipsi
 
 @lru_cache(maxsize=32)
 def background(key: str) -> Image.Image:
-    """الخلفية المشتركة لثيم: تدرج + نمط خفيف + توهج + إطار (تُخزَّن مؤقتًا وتُنسخ عند الاستخدام)."""
+    """خلفية فاتحة: تدرج أبيض مزرق + نقاط «هاف تون» في الزاويتين + لمسة خفيفة بلون اللعبة (تُخزَّن وتُنسخ)."""
     t = THEMES[key]
-    bg = Image.new("RGBA", (W, H), BG + (255,))
+    top, bottom = (249, 250, 253), (234, 239, 246)
+    bg = Image.new("RGBA", (W, H), top + (255,))
     d = ImageDraw.Draw(bg)
     for y in range(H):
-        d.line((0, y, W, y), fill=mix(BG, mix(BG, t.accent, 0.24), y / H) + (255,))
-    pat = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    pd = ImageDraw.Draw(pat)
-    a = t.accent + (34,)
-    rnd = random.Random(key)
-    if t.pattern == "grid":
-        for x in range(0, W, px(26)):
-            pd.line((x, 0, x, H), fill=a)
-        for y in range(0, H, px(26)):
-            pd.line((0, y, W, y), fill=a)
-    elif t.pattern == "lines":
-        for i in range(-H, W, px(24)):
-            pd.line((i, H, i + H, 0), fill=a, width=2)
-    elif t.pattern == "dots":
-        for x in range(px(14), W, px(24)):
-            for y in range(px(14), H, px(24)):
-                pd.ellipse((x - 3, y - 3, x + 3, y + 3), fill=a)
-    elif t.pattern == "rings":
-        for r in range(px(40), px(420), px(38)):
-            pd.ellipse((W // 2 - r, H // 2 - r, W // 2 + r, H // 2 + r), outline=a, width=2)
-    elif t.pattern == "coins":
-        for _ in range(26):
-            x, y, r = rnd.randint(0, W), rnd.randint(0, H), rnd.randint(px(10), px(26))
-            pd.ellipse((x - r, y - r, x + r, y + r), outline=a, width=2)
-            pd.ellipse((x - r * 0.6, y - r * 0.6, x + r * 0.6, y + r * 0.6), outline=a, width=1)
-    else:  # tiles
-        for _ in range(30):
-            x, y, s = rnd.randint(0, W), rnd.randint(0, H), rnd.randint(px(12), px(32))
-            pd.rounded_rectangle((x, y, x + s, y + s), radius=px(4), outline=a, width=2)
-    bg.alpha_composite(pat)
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse((W // 2 - px(190), H // 2 - px(100), W // 2 + px(190), H // 2 + px(120)),
-                                 fill=t.accent + (70,))
-    bg.alpha_composite(glow.filter(ImageFilter.GaussianBlur(px(48))))
-    Canvas._rr_on(bg, (8, 8, LW - 8, LH - 8), 16, outline=t.accent + (150,), width=1.5)
+        d.line((0, y, W, y), fill=mix(top, bottom, y / H) + (255,))
+    tint = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(tint).ellipse((W // 2 - px(260), -px(150), W // 2 + px(260), px(70)), fill=t.accent + (34,))
+    bg.alpha_composite(tint.filter(ImageFilter.GaussianBlur(px(40))))
+    k = 2
+    dots = Image.new("RGBA", (W * k, H * k), (0, 0, 0, 0))
+    dd = ImageDraw.Draw(dots)
+    step, reach = px(11) * k, 0.46 * W * k
+    for cx, cy in ((W * k, 0), (0, H * k)):
+        for x in range(0, W * k, step):
+            for y in range(0, H * k, step):
+                f = 1 - math.hypot(x - cx, y - cy) / reach
+                if f > 0.06:
+                    r = max(1.0, f * step * 0.36)
+                    dd.ellipse((x - r, y - r, x + r, y + r), fill=(120, 140, 175, int(40 + 70 * f)))
+    bg.alpha_composite(dots.resize((W, H), Image.LANCZOS))
+    Canvas._rr_on(bg, (8, 8, LW - 8, LH - 8), 16, outline=(190, 200, 218, 190), width=1.5)
     return bg
 
 
@@ -151,6 +168,7 @@ class Canvas:
     # ---- أشكال
     @staticmethod
     def _rr_on(img: Image.Image, box, radius, fill=None, outline=None, width=1.0):
+        fill, outline = tone_shape(fill), tone_shape(outline)
         x0, y0, x1, y1 = [px(v) for v in box]
         pad, k = 2, 3
         w, h = x1 - x0 + pad * 2, y1 - y0 + pad * 2
@@ -173,15 +191,15 @@ class Canvas:
             w, h = px(x1 - x0) + pad * 2, px(y1 - y0) + pad * 2
             layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             ImageDraw.Draw(layer).rounded_rectangle((pad, pad + px(3), w - pad, h - pad + px(3)), radius=px(radius),
-                                                    fill=(0, 0, 0, 120))
-            self.img.alpha_composite(layer.filter(ImageFilter.GaussianBlur(px(5))), (px(x0) - pad, px(y0) - pad))
+                                                    fill=(30, 50, 90, 62))
+            self.img.alpha_composite(layer.filter(ImageFilter.GaussianBlur(px(6))), (px(x0) - pad, px(y0) - pad))
         self.rr(box, radius, fill, outline, width)
-        self.line((x0 + radius, y0 + 1.5), (x1 - radius, y0 + 1.5), (255, 255, 255, 30), 1)
 
     def pill(self, box, fill=None, outline=None, width=1.0):
         self.rr(box, (box[3] - box[1]) / 2, fill, outline, width)
 
     def circle(self, cx, cy, r, fill=None, outline=None, width=1.0):
+        fill, outline = tone_shape(fill), tone_shape(outline)
         k = 3
         d = px(r * 2) + 8
         layer = Image.new("RGBA", (d * k, d * k), (0, 0, 0, 0))
@@ -190,10 +208,10 @@ class Canvas:
         self.img.alpha_composite(layer.resize((d, d), Image.LANCZOS), (px(cx) - d // 2, px(cy) - d // 2))
 
     def poly(self, pts, fill):
-        ImageDraw.Draw(self.img).polygon([(px(x), px(y)) for x, y in pts], fill=fill)
+        ImageDraw.Draw(self.img).polygon([(px(x), px(y)) for x, y in pts], fill=tone_shape(fill))
 
     def line(self, p0, p1, fill, width=1.0):
-        ImageDraw.Draw(self.img).line((px(p0[0]), px(p0[1]), px(p1[0]), px(p1[1])), fill=fill, width=max(1, px(width)))
+        ImageDraw.Draw(self.img).line((px(p0[0]), px(p0[1]), px(p1[0]), px(p1[1])), fill=tone_shape(fill), width=max(1, px(width)))
 
     def glow(self, cx, cy, r, color, alpha=120, blur=24):
         layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -202,7 +220,8 @@ class Canvas:
 
     # ---- نصوص
     def text(self, text: str, x: float, y: float, size: float, fill=WHITE, anchor: str = "mm",
-             max_w: Optional[float] = None, shadow: bool = True, weight: Optional[str] = None) -> float:
+             max_w: Optional[float] = None, shadow: bool = True, weight: Optional[str] = None,
+             raw: bool = False) -> float:
         """نص بنظام الخطوط الموحّد (DIN-like + عربي) مع ظل. الوزن تلقائي: خافت للنصوص الثانوية وعريض لغيرها."""
         if not text:
             return size
@@ -211,9 +230,7 @@ class Canvas:
         if max_w:
             text, size = fit_text(text, size, max_w, weight=weight)
         d = ImageDraw.Draw(self.img)
-        if shadow:
-            fonts.draw(d, (px(x) + 2, px(y) + 3), text, px(size), SHADOW, anchor=anchor, weight=weight)
-        fonts.draw(d, (px(x), px(y)), text, px(size), fill, anchor=anchor, weight=weight)
+        fonts.draw(d, (px(x), px(y)), text, px(size), fill if raw else tone_text(fill), anchor=anchor, weight=weight)
         return size
 
     def wrap(self, text: str, size: float, max_w: float, max_lines: int = 3) -> list[str]:
@@ -258,8 +275,32 @@ class Canvas:
             self.pill((LW / 2 - bw / 2, 15, LW / 2 + bw / 2, 39), (255, 255, 255, 28), (255, 255, 255, 70), 1)
             self.text(badge, LW / 2, 27, 13, MUTED, shadow=False)
 
+    def top_bar(self, title: Optional[str] = None, event: bool = False):
+        """رأس بسيط للأسئلة: الشعار وعنوان كبير يمينًا، ومؤقت mm:ss في الطرف الآخر (يُرسم في timer)."""
+        t = self.theme
+        label = (title or t.title) + ("  ·  فعالية" if event else "")
+        right = LW - 24
+        logo = _brand.circle(self.brand, px(30)) if self.brand else None
+        if logo is not None:
+            self.circle(right - 15, 30, 18, None, t.accent + (230,), 1.5)
+            self.img.alpha_composite(logo, (px(right - 15) - logo.width // 2, px(30) - logo.height // 2))
+            right -= 44
+        self.text(label, right, 30, 22, WHITE, anchor="rm", max_w=right - 150)
+        self.bar_style = True
+
     def timer(self, frac: float, left: int):
         t = self.theme
+        if getattr(self, "bar_style", False):
+            left = max(0, left)
+            self.rr((24, 14, 104, 46), 10, fill=(255, 255, 255, 255), outline=LINE + (255,), width=1.5)
+            self.text(f"{left // 60:02d}:{left % 60:02d}", 64, 30, 19, WHITE, shadow=False)
+            x0, x1, y0, y1 = 24, LW - 24, 56, 63
+            self.rr((x0, y0, x1, y1), 4, fill=(255, 255, 255, 40), outline=LINE + (150,), width=1)
+            frac = max(0.0, min(1.0, frac))
+            if frac > 0.003:
+                col = t.accent if frac > 0.5 else (mix(AMBER, t.accent, (frac - 0.25) / 0.25) if frac > 0.25 else RED)
+                self.rr((x1 - max(8, (x1 - x0) * frac), y0, x1, y1), 4, fill=col + (255,))
+            return
         x0, x1, y0, y1 = 56, LW - 28, 322, 338
         self.rr((x0, y0, x1, y1), 8, fill=(255, 255, 255, 30))
         frac = max(0.0, min(1.0, frac))
@@ -313,7 +354,8 @@ class Canvas:
 
     def copy(self) -> "Canvas":
         c = Canvas.__new__(Canvas)
-        c.theme, c.img = self.theme, self.img.copy()
+        c.__dict__.update(self.__dict__)
+        c.img = self.img.copy()
         return c
 
 

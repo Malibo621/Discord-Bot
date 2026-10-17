@@ -127,26 +127,34 @@ def render_quiz(question: str, options: Sequence[str], seconds: int, reward: Opt
     def base():
         c = Canvas("quiz")
         t = c.theme
-        c.header(reward, event)
-        _panel(c, (20, 52, LW - 20, 160))
-        size = 27
-        lines = c.wrap(question, size, LW - 100, 3)
-        while len(lines) > 2 and size > 19:
+        c.top_bar(None, event)
+        if reward:
+            c.text(f"الجائزة: {reward}", LW - 24, 80, 13.5, GOLD, anchor="rm", shadow=False)
+        c.text("اختر الإجابة الصحيحة", 24, 80, 13.5, MUTED, anchor="lm", shadow=False)
+        size = 30
+        lines = c.wrap(question, size, LW - 90, 3)
+        while len(lines) > 2 and size > 20:
             size -= 2
-            lines = c.wrap(question, size, LW - 100, 3)
-        top = 106 - (len(lines) - 1) * (size + 6) / 2
+            lines = c.wrap(question, size, LW - 90, 3)
+        top = 134 - (len(lines) - 1) * (size + 10) / 2
         for i, line in enumerate(lines):
-            c.text(line, LW / 2, top + i * (size + 8), size, WHITE, max_w=LW - 100)
+            c.text(line, LW / 2, top + i * (size + 12), size, WHITE, max_w=LW - 90)
         cols = [t.accent, GREEN, AMBER, RED]
-        bw, bh, gx, gy = 292, 56, 14, 12
+        bw, bh, gx, gy = 292, 58, 16, 14
         for i, opt in enumerate(options[:4]):
             r, col = divmod(i, 2)
             x = (LW - 2 * bw - gx) / 2 + (1 - col) * (bw + gx)   # الخيار الأول في اليمين
-            y = 172 + r * (bh + gy)
-            c.rr((x, y, x + bw, y + bh), 14, fill=PANEL + (238,), outline=cols[i] + (225,), width=1.8)
-            c.rr((x + bw - 46, y + 8, x + bw - 8, y + bh - 8), 10, fill=cols[i] + (255,))
-            c.text("ABCD"[i], x + bw - 27, y + bh / 2, 22, (20, 18, 36), shadow=False)
-            c.text(opt, x + bw - 58, y + bh / 2, 21, WHITE, anchor="rm", max_w=bw - 84, shadow=False)
+            y = 204 + r * (bh + gy)
+            c.card((x, y, x + bw, y + bh), bh / 2, fill=(255, 255, 255, 255), outline=(17, 27, 51, 255), width=1.8)
+            c.circle(x + bw - 29, y + bh / 2, 15, cols[i] + (255,))
+            c.text("ABCD"[i], x + bw - 29, y + bh / 2, 17, (255, 255, 255, 255), shadow=False, raw=True)
+            lines2 = c.wrap(opt, 18, bw - 92, 2)
+            if len(lines2) == 1:
+                c.text(lines2[0], x + bw - 54, y + bh / 2, 19, WHITE, anchor="rm", max_w=bw - 80, shadow=False)
+            else:
+                for j, ln in enumerate(lines2):
+                    c.text(ln, x + bw - 54, y + bh / 2 + (j - 0.5) * 22, 16.5, WHITE, anchor="rm", max_w=bw - 80,
+                           shadow=False)
         return c
 
     return _timed(base, "quiz", seconds, animate)
@@ -170,8 +178,8 @@ def render_fast(question: str, seconds: int, reward: Optional[str], hint: Option
         c.text("أول إجابة صحيحة تكتبها في الشات تفوز", LW / 2, 258, 18, MUTED, shadow=False)
         if hint:
             hw = text_width(hint, 17) + 34
-            c.pill((LW / 2 - hw / 2, 272, LW / 2 + hw / 2, 304), GOLD + (40,), GOLD + (200,), 1.4)
-            c.text(hint, LW / 2, 288, 17, (255, 232, 160), shadow=False)
+            c.pill((LW / 2 - hw / 2, 280, LW / 2 + hw / 2, 312), GOLD + (40,), GOLD + (200,), 1.4)
+            c.text(hint, LW / 2, 296, 17, (255, 232, 160), shadow=False)
         return c
 
     return _timed(base, "fast", seconds, animate)
@@ -224,7 +232,7 @@ def render_result(game: str, headline: str, details: Sequence[tuple[str, str]], 
     """شاشة النتيجة: فائز (أفاتار + تفاصيل + قصاصات ورق) أو انتهاء الوقت (كشف الإجابة)."""
     c = Canvas(game)
     if not winner:
-        c.img.alpha_composite(Image.new("RGBA", c.img.size, (10, 9, 20, 120)))
+        c.img.alpha_composite(Image.new("RGBA", c.img.size, (225, 230, 240, 120)))
     c.header(reward, event, "النتيجة")
     c.rr((22, 54, LW - 22, 336), 24, fill=PANEL + (238,), outline=(GOLD if winner else MUTED) + (190,), width=2)
     cy = 128
