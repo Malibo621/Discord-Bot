@@ -176,7 +176,8 @@ def render_leaderboard(*, rows: Sequence[dict], avatars: dict[int, Optional[byte
     """rows: [{rank, user_id, name, balance}] حتى 10 صفوف."""
     c = Canvas("board")
     c.header("لوحة المتصدرين", name_of(guild_name, 28), f"صفحة {page} من {pages}")
-    col_w, row_h, gap, top = (LW - 2 * M - 14) / 2, 44, 5, 66
+    single = len(rows) <= 5                    # قلة الصفوف: عمود واحد بعرض كامل بدل نصف الصورة فارغًا
+    col_w, row_h, gap, top = ((LW - 2 * M) if single else (LW - 2 * M - 14) / 2), 44, 5, 66
     for i, r in enumerate(rows[:10]):
         col, row = divmod(i, 5)
         x1 = LW - M - col * (col_w + 14)
