@@ -1,6 +1,8 @@
 """نظام الموسيقى: تشغيل عبر yt-dlp + FFmpeg، قائمة انتظار ولوحة تحكم تفاعلية مستقلة لكل سيرفر.
 
-- لوحة التحكم (MusicPanelView): رسالة واحدة تُحدَّث في مكانها عند تغيّر الأغنية أو حالتها (بدل رسالة جديدة كل مرة).
+- لوحة التحكم (MusicPanelView): رسالة واحدة (Components V2) تُحدَّث في مكانها عند تغيّر الأغنية أو حالتها، بترتيب ثابت
+  من الأعلى للأسفل: بطاقة الأغنية (غلاف/عنوان/فنان/تقدّم) ← أزرار التحكم ← الطابور القادم (قائمة رأسية).
+  الطابور الكامل بصفحاته وإدارته (حذف/مسح) في رسالة مخفية بزر «القائمة الكاملة».
 - الوقت المعروض هو عدّاد إطارات الصوت المُرسَلة فعلًا لديسكورد (20ms للإطار) فيتوقف مع الإيقاف المؤقت؛ ولا يُعرض
   تقدّم إن تعذّر قراءته أو كانت المدة غير معروفة (بث مباشر).
 - الصلاحيات تُفحص من الخادم عند كل زر وأمر: الإيقاف المؤقت لمن هو في نفس الروم الصوتي، وبقية التحكم لصاحب الأغنية
@@ -50,6 +52,7 @@ VOLUME_STEP = 10
 MIN_VOLUME, MAX_VOLUME = 5, 150
 PANEL_MIN_INTERVAL = 1.0  # أقل فاصل بين تحديثات اللوحة التلقائية (حماية من حدود ديسكورد)
 QUEUE_PAGE = 10
+QUEUE_INLINE = 5          # عدد الأغاني القادمة الظاهرة داخل اللوحة نفسها
 RECONNECT_WAIT = 20       # ثوانٍ ننتظر فيها عودة الاتصال الصوتي (24/7) قبل التخلي عن الجلسة
 
 
@@ -346,6 +349,35 @@ class GuildPlayer:
                 log.exception("Now-playing card failed; using text embed")
         return self.text_embed(idle=idle), None
 
+    def queue_text(self, rows: int = QUEUE_INLINE) -> str:
+        """الطابور كقائمة رأسية: الأغنية الحالية مميّزة ثم القادمة بأرقامها (رقم · عنوان · مدة · الطالب)."""
+        lines = []
+        total = sum(t.duration for t in self.queue)
+        lines.append(f"### 📃 الطابور · {len(self.queue)} أغنية" + (f" · {total // 60} دقيقة" if total else ""))
+        if self.current is not None:
+            lines.append(f"▶️ **الآن** · {self.current.title[:52]} · `{self.current.length}`")
+        shown = list(self.queue)[:rows]
+        for i, t in enumerate(shown, 1):
+            lines.append(f"`{i:>2}` {t.title[:46]} · `{t.length}` · {t.requester.display_name[:16]}")
+        if len(self.queue) > rows:
+            lines.append(f"*و {len(self.queue) - rows} أغنية أخرى — اضغط «القائمة الكاملة»*")
+        elif not self.queue:
+            lines.append("*لا توجد أغانٍ قادمة — أضف أغنية بـ `/play`*")
+        return "\n".join(lines)[:3800]
+
+    def summary_text(self, *, idle: bool = False) -> str:
+        """بديل نصي للبطاقة المصوّرة (عند تعطيلها أو تعذّر رسمها)."""
+        t = self.current
+        if t is None or idle:
+            return f"### {ui.Icons.MUSIC} لوحة الموسيقى\nانتهت قائمة التشغيل."
+        head = "⏸️ متوقف مؤقتًا" if self.paused else "يتم التشغيل الآن"
+        parts = [f"### {ui.Icons.MUSIC} {head}", f"**[{t.title}]({t.url})**"]
+        if t.artist:
+            parts.append(("📻 القناة: " if t.by_channel else "🎤 الفنان: ") + t.artist)
+        parts.append(f"⏱️ `{t.length}` · 🔊 `{int(self.volume * 100)}%` · 🙋 {t.requester.display_name}"
+                     + (" · 🔁 تكرار" if self.loop else ""))
+        return "\n".join(parts)
+
     def text_embed(self, *, idle: bool = False) -> discord.Embed:
         t = self.current
         if t is None or idle:
@@ -389,16 +421,14 @@ class GuildPlayer:
     async def refresh_panel(self, *, force: bool = False, idle: bool = False) -> None:
         """يحدّث رسالة اللوحة في مكانها، وينشئها مرة واحدة فقط أول مرة (أو إن حُذفت)."""
         async with self._panel_lock:
-            embed, png = await self.panel_payload(idle=idle)
-            view = None
-            if not idle:
-                if self.panel_view is None:
-                    self.panel_view = MusicPanelView(self)
-                self.panel_view.sync()
-                view = self.panel_view
+            _embed, png = await self.panel_payload(idle=idle)
+            if self.panel_view is None:
+                self.panel_view = MusicPanelView(self)
+            view = self.panel_view
+            view.render(has_image=png is not None, idle=idle)
             if self.panel_message is not None:
-                kwargs: dict = {"embed": embed, "view": view}
-                kwargs["attachments"] = [ui.card_file(png, "nowplaying.png", "لوحة الموسيقى")] if png else []
+                kwargs: dict = {"view": view,
+                                "attachments": [ui.card_file(png, "nowplaying.png", "لوحة الموسيقى")] if png else []}
                 try:
                     await self.panel_message.edit(**kwargs)
                     self._last_panel = time.monotonic()
@@ -412,7 +442,7 @@ class GuildPlayer:
                     return
             if idle or self.text_channel is None or self.current is None:
                 return
-            kwargs = {"embed": embed, "view": view}
+            kwargs = {"view": view}
             if png:
                 kwargs["file"] = ui.card_file(png, "nowplaying.png", "لوحة الموسيقى")
             self.panel_message = await ui.safe_send(self.text_channel, **kwargs)
@@ -440,43 +470,66 @@ class GuildPlayer:
 
 # ====================================================================== اللوحة التفاعلية
 class _PanelButton(discord.ui.Button):
-    def __init__(self, action: str, label: str, emoji: str, style=discord.ButtonStyle.secondary, row: int = 0,
+    def __init__(self, action: str, label: str, emoji: str, style=discord.ButtonStyle.secondary,
                  disabled: bool = False):
-        super().__init__(label=label, emoji=emoji, style=style, row=row, disabled=disabled)
+        super().__init__(label=label or None, emoji=emoji, style=style, disabled=disabled)
         self.action = action
 
     async def callback(self, interaction: discord.Interaction):
         await self.view.handle(interaction, self.action)
 
 
-class MusicPanelView(ui.BaseView):
-    """أزرار لوحة الموسيقى. كل ضغطة تُفحص صلاحيتها من الخادم وتُنفَّذ على الحالة الفعلية لمشغّل الصوت."""
+class MusicPanelView(discord.ui.LayoutView):
+    """لوحة الموسيقى (Components V2): بطاقة الأغنية ← أزرار التحكم ← الطابور. كل ضغطة تُفحص صلاحيتها من الخادم
+    وتُنفَّذ على الحالة الفعلية لمشغّل الصوت."""
 
     CONTROL = {"previous", "skip", "stop", "loop", "vol_down", "vol_up"}
 
     def __init__(self, player: GuildPlayer):
-        super().__init__(owner_id=None, timeout=None)
+        super().__init__(timeout=None)
         self.player = player
-        self.btn_pause = _PanelButton("pause", "إيقاف مؤقت", "⏸️", discord.ButtonStyle.primary, 0)
-        self.btn_loop = _PanelButton("loop", "تكرار", "🔁", row=0)
-        self.btn_vol = _PanelButton("noop", "الصوت", "🔊", row=1, disabled=True)
-        for b in (_PanelButton("previous", "السابق", "⏮️", row=0), self.btn_pause,
-                  _PanelButton("skip", "تخطي", "⏭️", row=0), _PanelButton("stop", "إيقاف", "⏹️",
-                                                                              discord.ButtonStyle.danger, 0),
-                  self.btn_loop,
-                  _PanelButton("vol_down", "", "🔉", row=1), self.btn_vol, _PanelButton("vol_up", "", "🔊", row=1),
-                  _PanelButton("queue", "القائمة", "📃", row=1), _PanelButton("refresh", "تحديث", "🔄", row=1)):
-            self.add_item(b)
+        self.message: Optional[discord.Message] = None
+        self.render(has_image=False, idle=False)
 
-    def sync(self) -> None:
+    def render(self, *, has_image: bool, idle: bool) -> None:
+        """يعيد بناء مكوّنات اللوحة من الحالة الحالية (بطاقة، أزرار، طابور)."""
         p = self.player
-        self.btn_pause.label = "استئناف" if p.paused else "إيقاف مؤقت"
-        self.btn_pause.emoji = "▶️" if p.paused else "⏸️"
-        self.btn_loop.style = discord.ButtonStyle.success if p.loop else discord.ButtonStyle.secondary
-        self.btn_vol.label = f"{int(p.volume * 100)}%"
+        self.clear_items()
+        box = discord.ui.Container(accent_colour=discord.Colour(ui.Colors.MUSIC))
+        if has_image:
+            box.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem("attachment://nowplaying.png",
+                                                                          description="لوحة الموسيقى")))
+        else:
+            box.add_item(discord.ui.TextDisplay(p.summary_text(idle=idle)))
+        if not idle:
+            B = discord.ButtonStyle
+            box.add_item(discord.ui.ActionRow(
+                _PanelButton("previous", "السابق", "⏮️"),
+                _PanelButton("pause", "استئناف" if p.paused else "إيقاف مؤقت", "▶️" if p.paused else "⏸️", B.primary),
+                _PanelButton("skip", "تخطي", "⏭️"),
+                _PanelButton("stop", "إيقاف", "⏹️", B.danger)))
+            box.add_item(discord.ui.ActionRow(
+                _PanelButton("vol_down", "", "🔉"),
+                _PanelButton("noop", f"{int(p.volume * 100)}%", "🔊", disabled=True),
+                _PanelButton("vol_up", "", "🔊"),
+                _PanelButton("loop", "تكرار", "🔁", B.success if p.loop else B.secondary),
+                _PanelButton("queue", "القائمة الكاملة", "📃")))
+            box.add_item(discord.ui.Separator())
+            box.add_item(discord.ui.TextDisplay(p.queue_text()))
+        self.add_item(box)
+
+    def sync(self) -> None:   # توافق مع الاستدعاءات القديمة: إعادة البناء تتم في render
+        self.render(has_image=True, idle=False)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return True   # الفحص التفصيلي لكل زر داخل handle
+
+    async def on_error(self, interaction: discord.Interaction, exc: Exception, item: discord.ui.Item) -> None:
+        log.exception("Music panel error", exc_info=exc)
+        try:
+            await ui.reply(interaction, ui.error("حدث خطأ غير متوقع أثناء تنفيذ هذا الإجراء."), ephemeral=True)
+        except discord.HTTPException:
+            pass
 
     async def handle(self, interaction: discord.Interaction, action: str) -> None:
         p, cog = self.player, self.player.cog
@@ -910,7 +963,7 @@ class Music(commands.Cog):
         await player.refresh_panel(force=True)
         if old is not None:
             try:
-                await old.edit(view=None)
+                await old.delete()          # رسائل Components V2 لا يمكن تجريدها من المكوّنات: تُحذف
             except discord.HTTPException:
                 pass
         await interaction.followup.send(embed=ui.success("تم", "ظهرت لوحة التحكم في هذا الروم."), ephemeral=True)

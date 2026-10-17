@@ -20,7 +20,8 @@ from discord.ext import commands
 
 from bot import images, ui
 from bot.checks import NoPermission, allowed
-from bot.settings_schema import PERMISSION_CATEGORIES, SETTINGS, SETTINGS_BY_KEY, Setting, format_value, parse_value
+from bot.settings_schema import (PERMISSION_CATEGORIES, SETTINGS, SETTINGS_BY_KEY, Setting, describe, format_value,
+                                 help_for, parse_value)
 from cogs.economy import POINT_ACTIONS, apply_points_change
 from cogs.games import GAMES, add_custom_question, add_custom_word, content_embed
 from cogs.shop import deliver_purchase, refund_purchase, role_sale_error
@@ -48,10 +49,20 @@ _SECTIONS = [
     Section("channels", "القنوات والسجلات", "📢", "رومات السجلات وروم الألعاب", ADMIN, ("القنوات",)),
     Section("protection", "الحماية والإدارة", "🛡️", "السبام، الروابط، التخريب، والعقوبات التلقائية", ADMIN,
             ("الحماية", "الإدارة")),
+    Section("music", "الصوت والموسيقى", "🎵", "الاتصال الدائم بروم صوتي، ورتب التحكم بالموسيقى", ADMIN,
+            ("الصوت والموسيقى",)),
     Section("permissions", "الصلاحيات", "🔐", "ربط فئات الأوامر برتب السيرفر", ADMIN),
     Section("commands", "الأوامر والاختصارات", "🧩", "استعراض الأوامر وتعطيلها وتعديل أوصافها واختصاراتها النصية",
             ADMIN, ("الأوامر والاختصارات",)),
 ]
+
+
+# تجميع الأقسام في الصفحة الرئيسية حسب وظيفتها (لا يغيّر الصلاحيات: كل قسم يفحص صلاحيته بنفسه)
+CATEGORIES = (
+    ("🎮 الفعاليات والاقتصاد", ("games", "economy", "shop")),
+    ("🛡️ الحماية والإدارة", ("protection",)),
+    ("🔧 السيرفر والبوت", ("channels", "music", "permissions", "commands")),
+)
 
 
 def _with_fallback(sections: list[Section]) -> list[Section]:
@@ -69,6 +80,25 @@ PAGE = 25
 
 def section_settings(section: Section) -> list[Setting]:
     return [st for st in SETTINGS if st.group in section.groups]
+
+
+def settings_help_pages(section: Section, values: dict, per_page: int = 6) -> list[discord.Embed]:
+    """صفحات «شرح الإعدادات»: لكل إعداد اسمه، وظيفته، قيمته الحالية، مداه وافتراضيه، وكيف يُغيَّر."""
+    sts = section_settings(section)
+    chunks = [sts[i:i + per_page] for i in range(0, len(sts), per_page)] or [[]]
+    pages = []
+    for n, chunk in enumerate(chunks, 1):
+        e = ui.info(f"📖 شرح إعدادات {section.label}", ui.LINE, ui.Colors.ADMIN)
+        for st in chunk:
+            how = {"bool": "اختره من القائمة ليتبدّل فورًا", "int": "اختره ثم اكتب الرقم في النافذة",
+                   "str": "اختره ثم اكتب النص في النافذة", "channel": "اختره ثم اختر الروم",
+                   "role": "اختره ثم اختر الرتبة"}[st.kind]
+            e.add_field(name=f"{KIND_EMOJI[st.kind]} {st.label}"[:256],
+                        value=f"{help_for(st) or '—'}\n**الحالي:** {format_value(st, values[st.key])}\n"
+                              f"-# {describe(st)} · {how}"[:1024], inline=False)
+        e.set_footer(text=f"صفحة {n} من {len(chunks)}")
+        pages.append(e)
+    return pages
 
 
 def plain_value(st: Setting, value) -> str:
@@ -158,6 +188,8 @@ class PanelView(ui.BaseView):
         else:
             embed = await self._settings_section(member, s)
 
+        if self.section is not None or self.mode is not None:
+            self.add_item(ActionButton("home", "الرئيسية", "🏠", row=4))
         self.add_item(CloseButton())
         if self.status:
             ok, text = self.status
@@ -166,24 +198,48 @@ class PanelView(ui.BaseView):
             self.status = None
         return ui.brand(embed, guild, "لوحة التحكم")
 
+    async def _attention(self, s, pending) -> list[str]:
+        """ما يستحق انتباه المسؤول الآن (إعدادات ناقصة وطلبات معلّقة) — لا شيء شكلي: كلها من الحالة الفعلية."""
+        notes = []
+        if not s["log_channel"]:
+            notes.append("لم يُحدَّد **روم سجل السيرفر** — القنوات والسجلات")
+        if not s["mod_log_channel"] and not s["log_channel"]:
+            notes.append("لا يوجد **روم سجل للإدارة** (تحذيرات/كتم/حظر) — القنوات والسجلات")
+        if pending:
+            notes.append(f"**{len(pending)}** طلب معلّق في المتجر ينتظر التسليم — المتجر")
+        if not s["games_channel"]:
+            notes.append("الألعاب مفتوحة في **كل الرومات** (حدد روم الألعاب إن أردت حصرها)")
+        return notes
+
     async def _home(self, guild, s, sections) -> discord.Embed:
         db = self.bot.db
         enabled = sum(1 for k in GAMES if s.get(f"game_{k}_enabled", True))
         items = await db.shop_items(self.guild_id, include_inactive=True)
         pending = await db.pending_purchases(self.guild_id)
         e = ui.info(f"{ui.Icons.ADMIN}  لوحة التحكم — {guild.name if guild else ''}",
-                    "اختر قسمًا من القائمة بالأسفل. كل تعديل يُحفظ فورًا ويبقى بعد إعادة التشغيل.\n" + ui.LINE,
-                    ui.Colors.ADMIN)
+                    "كل إعدادات البوت من هنا. **اختر قسمًا من القائمة بالأسفل** ← ثم الإعداد المطلوب ← يُحفظ فورًا "
+                    "ويبقى بعد إعادة التشغيل.\n" + ui.LINE, ui.Colors.ADMIN)
         e.add_field(name="🎮 الألعاب", value=f"`{enabled}/{len(GAMES)}` مفعّلة")
         e.add_field(name=f"{s['currency_emoji']} العملة", value=s["currency_name"])
         e.add_field(name="🛒 المتجر", value=f"`{sum(1 for i in items if i['active'])}` منتج  ·  "
                                            f"`{len(pending)}` طلب معلّق")
         e.add_field(name="📋 روم السجل", value=f"<#{s['log_channel']}>" if s["log_channel"] else "`غير محدد`")
-        e.add_field(name="⏱️ انتظار الألعاب", value=f"`{s['game_cooldown']}` ث")
+        e.add_field(name="🎵 الاتصال الدائم",
+                    value=f"<#{s['voice_home_channel']}>" if s["voice_home_channel"] else "`غير مفعّل`")
         e.add_field(name="📊 حد الكسب اليومي", value=f"`{s['daily_earn_cap']:,}`" if s["daily_earn_cap"] else "`بلا حد`")
-        e.add_field(name="الأقسام المتاحة لك",
-                    value="\n".join(f"{sec.emoji} **{sec.label}** — {sec.about}" for sec in sections) or "—",
-                    inline=False)
+        by_key = {sec.key: sec for sec in sections}
+        for title, keys in CATEGORIES:
+            lines = [f"{by_key[k].emoji} **{by_key[k].label}** — {by_key[k].about}" for k in keys if k in by_key]
+            if lines:
+                e.add_field(name=title, value="\n".join(lines), inline=False)
+        extra = [sec for sec in sections if sec.key not in {k for _t, ks in CATEGORIES for k in ks}]
+        if extra:
+            e.add_field(name="⚙️ أخرى", value="\n".join(f"{x.emoji} **{x.label}** — {x.about}" for x in extra),
+                        inline=False)
+        notes = await self._attention(s, pending)
+        e.add_field(name="🔔 ما يحتاج انتباهك" if notes else "✅ الحالة",
+                    value="\n".join(f"• {n}" for n in notes) if notes else "كل شيء مضبوط.", inline=False)
+        e.set_footer(text="تلميح: داخل أي قسم اضغط «شرح الإعدادات» لمعرفة وظيفة كل إعداد وقيمته وطريقة تغييره")
         if guild and guild.icon:
             e.set_thumbnail(url=guild.icon.url)
         return e
@@ -204,14 +260,16 @@ class PanelView(ui.BaseView):
 
         if self.mode == "channel" and self.target in SETTINGS_BY_KEY:
             st = SETTINGS_BY_KEY[self.target]
-            e.add_field(name="#️⃣ اختيار روم", value=f"اختر الروم الجديد لـ **{st.label}** من القائمة.", inline=False)
+            e.add_field(name="#️⃣ اختيار روم", value=f"اختر الروم الجديد لـ **{st.label}** من القائمة.\n"
+                                                    f"> {help_for(st)}", inline=False)
             self.add_item(ChannelPicker(st))
             self.add_item(ActionButton("clear_channel", "إلغاء التحديد", "🧹", discord.ButtonStyle.danger, row=2))
             self.add_item(ActionButton("back", "رجوع", "↩️", row=2))
             return e
         if self.mode == "role_setting" and self.target in SETTINGS_BY_KEY:
             st = SETTINGS_BY_KEY[self.target]
-            e.add_field(name="🎖️ اختيار رتبة", value=f"اختر الرتبة الجديدة لـ **{st.label}** من القائمة.", inline=False)
+            e.add_field(name="🎖️ اختيار رتبة", value=f"اختر الرتبة الجديدة لـ **{st.label}** من القائمة.\n"
+                                                      f"> {help_for(st)}", inline=False)
             self.add_item(RolePicker(max_values=1, placeholder=f"🎖️ {st.label}"[:100]))
             self.add_item(ActionButton("clear_channel", "إلغاء التحديد", "🧹", discord.ButtonStyle.danger, row=2))
             self.add_item(ActionButton("back", "رجوع", "↩️", row=2))
@@ -229,11 +287,15 @@ class PanelView(ui.BaseView):
             if pages > 1:
                 self.add_item(ActionButton("prev_page", "السابق", "◀️", row=4, disabled=self.page == 0))
                 self.add_item(ActionButton("next_page", "التالي", "▶️", row=4, disabled=self.page >= pages - 1))
-            e.set_footer(text="🔘 اختيار إعداد تفعيل يقلبه فورًا  ·  🔢 يفتح نافذة لإدخال القيمة")
+            e.set_footer(text="🔘 تفعيل/تعطيل فوري  ·  🔢 نافذة لإدخال القيمة  ·  #️⃣ 🎖️ قائمة اختيار  ·  "
+                              "«شرح الإعدادات» يوضح وظيفة كل إعداد")
+            self.add_item(ActionButton("explain", "شرح الإعدادات", "📖", row=2))
         elif sts:
             e.add_field(name="ℹ️ ملاحظة", value="تعديل هذه الإعدادات للمسؤولين فقط، ويمكنك استخدام الإجراءات أدناه.",
                         inline=False)
 
+        if sec.key == "music":
+            self.add_item(ActionButton("music_perms", "رتب التحكم بالموسيقى", "🔐", row=2))
         if sec.key == "economy" and await allowed(self.bot.db, member, "economy"):
             self.add_item(ActionButton("points:add", "إضافة نقاط", "➕", discord.ButtonStyle.success, row=2))
             self.add_item(ActionButton("points:remove", "خصم نقاط", "➖", discord.ButtonStyle.danger, row=2))
@@ -360,7 +422,8 @@ class PanelView(ui.BaseView):
             await self.bot.db.set_setting(self.guild_id, st.key, value)
         await self.log_setting(interaction, st, value)
         self.mode = None
-        await self.refresh(interaction, (True, f"**{st.label}** {ui.ARROW} {format_value(st, value)}"))
+        note = f"\n> {help_for(st)}" if help_for(st) else ""
+        await self.refresh(interaction, (True, f"**{st.label}** {ui.ARROW} {format_value(st, value)}{note}"))
 
     async def on_action(self, interaction: discord.Interaction, action: str):
         db = self.bot.db
@@ -369,6 +432,24 @@ class PanelView(ui.BaseView):
             return await self.refresh(interaction)
         if action in ("prev_page", "next_page"):
             self.page += -1 if action == "prev_page" else 1
+            return await self.refresh(interaction)
+        if action == "explain":
+            sec = self.section
+            if sec is None:
+                return await self.refresh(interaction)
+            if not await self.guard(interaction, sec.perm):
+                return
+            values = await db.get_settings(self.guild_id)
+            pages = settings_help_pages(sec, values)
+            return await ui.Paginator(pages, interaction.user.id).start(interaction, ephemeral=True)
+        if action == "music_perms":
+            if not await self.guard(interaction, ADMIN):
+                return
+            self.section, self.mode, self.target = SECTIONS_BY_KEY["permissions"], "perm_roles", "music"
+            return await self.refresh(interaction)
+        if action == "home":
+            self.section, self.mode, self.target, self.page = None, None, None, 0
+            self.confirm_refund = self.confirm_delete = None
             return await self.refresh(interaction)
         if action == "clear_channel":
             if not await self.guard(interaction, SETTING_PERM) or self.target not in SETTINGS_BY_KEY:
@@ -477,7 +558,7 @@ class SectionSelect(discord.ui.Select):
 class SettingSelect(discord.ui.Select):
     def __init__(self, settings: list[Setting], values: dict):
         options = [discord.SelectOption(label=st.label[:100], value=st.key, emoji=KIND_EMOJI[st.kind],
-                                        description=f"الحالي: {plain_value(st, values[st.key])}"[:100])
+                                        description=f"{plain_value(st, values[st.key])} — {help_for(st)}"[:100])
                    for st in settings]
         super().__init__(placeholder="⚙️ اختر إعدادًا لتعديله...", options=options, row=1)
 
@@ -684,8 +765,8 @@ class SettingModal(PanelModal):
         super().__init__(view, st.label)
         self.st = st
         hint = (f"من {st.min:,} إلى {st.max:,}" if st.kind == "int" and st.min is not None else "نص حتى 200 حرف")
-        self.value = discord.ui.TextInput(label="القيمة الجديدة", default=str(current), required=False,
-                                          max_length=200, placeholder=f"{hint} — اتركه فارغًا للقيمة الافتراضية"[:100])
+        self.value = discord.ui.TextInput(label=f"القيمة ({hint})"[:45], default=str(current), required=False,
+                                          max_length=200, placeholder=(help_for(st) or "اتركه فارغًا للافتراضي")[:100])
         self.add_item(self.value)
 
     async def apply(self, interaction):

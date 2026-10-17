@@ -292,3 +292,8 @@ python tests/test_features.py
 - الأرقام الضخمة لا تُقتطع أبدًا (تصغر ثم تُختصر «مليار/مليون»)، والأسماء الطويلة تصغر ثم تُقتطع بـ «…».
 - صور الأمثلة قبل/بعد في `design_preview/`. لإعادة توليدها: شغّل القوالب ببيانات تجريبية (انظر اختبارات `tests/test_features.py`).
 - للرجوع للتصميم السابق: `git checkout 281c4d1 -- bot/canvas.py bot/cards.py bot/gamecards.py bot/wheel.py`.
+
+## 14. أدلة الإدارة والتطوير
+
+- **[docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md)**: كيف تدير البوت من `/panel` (الأقسام، تعديل الإعدادات، الصلاحيات، لوحة الموسيقى).
+- **[docs/PROJECT_MAP.md](docs/PROJECT_MAP.md)**: مسؤولية كل ملف، وكيف تضيف إعدادًا أو أمرًا أو قسمًا أو بطاقة صورة.

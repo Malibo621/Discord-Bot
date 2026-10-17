@@ -277,61 +277,63 @@ def render_nowplaying(*, title: str, requester: str, duration: str, thumbnail: O
                       volume: int, loop: bool, guild_name: str, status: str = "يعمل الآن", artist: Optional[str] = None,
                       artist_is_channel: bool = False, elapsed: Optional[float] = None, total: int = 0,
                       paused: bool = False, next_title: Optional[str] = None, idle: bool = False) -> bytes:
-    """لوحة الموسيقى: غلاف، عنوان، فنان/قناة، تقدّم (فقط عند توفر وقت فعلي)، حالة، صوت، قائمة، والتالي."""
+    """بطاقة الأغنية: غلاف كبير، عنوان، فنان/قناة، شريط تقدّم (فقط عند توفر وقت فعلي) وشارات صغيرة.
+
+    الأزرار والطابور تأتي تحت هذه البطاقة في رسالة اللوحة نفسها (cogs/music.py)، لذا لا تُكرَّر هنا.
+    """
     c = Canvas("music")
     t = c.theme
     c.header("الموسيقى", name_of(guild_name, 28), "متوقف مؤقتًا" if paused else ("لا شيء يعمل" if idle else status))
-    c.hero((M, 66, LW - M, 332), 26, accent=WARN if paused else t.accent)
-    box = (M + 14, 80, M + 14 + 236, 80 + 133)
+    c.hero((M, 66, LW - M, 334), 26, accent=WARN if paused else t.accent)
+    box = (M + 16, 84, M + 16 + 288, 84 + 162)
     im = _cover(thumbnail, px(box[2] - box[0]), px(box[3] - box[1])) if thumbnail and not idle else None
+    mx, my = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
     if im is not None:
         _paste_rounded(c, im, box, 16)
     else:
         c.rr(box, 16, fill=(255, 255, 255, 22), outline=(255, 255, 255, 50), width=1)
-        mx, my = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-        c.circle(mx, my, 30, None, tuple(t.accent) + (255,), 3)
-        c.poly([(mx - 9, my - 15), (mx - 9, my + 15), (mx + 17, my)], tuple(t.accent) + (255,))
+        c.circle(mx, my, 32, None, tuple(t.accent) + (255,), 3)
+        c.poly([(mx - 10, my - 16), (mx - 10, my + 16), (mx + 18, my)], tuple(t.accent) + (255,))
     if paused:   # علامة «إيقاف مؤقت» فوق الغلاف
         c.rr(box, 16, fill=(12, 18, 40, 150))
-        mx, my = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-        c.rr((mx - 16, my - 24, mx - 5, my + 24), 4, fill=WHITE + (255,))
-        c.rr((mx + 5, my - 24, mx + 16, my + 24), 4, fill=WHITE + (255,))
-    tx = LW - M - 18
-    mw = tx - (box[2] + 18)
+        c.rr((mx - 17, my - 25, mx - 5, my + 25), 4, fill=WHITE + (255,))
+        c.rr((mx + 5, my - 25, mx + 17, my + 25), 4, fill=WHITE + (255,))
+    tx = LW - M - 20
+    mw = tx - (box[2] + 22)
     if idle:
-        c.text("انتهت قائمة التشغيل", tx, 118, 26, WHITE, anchor="rm", max_w=mw)
-        c.text("اطلب أغنية جديدة بـ /play", tx, 154, 16, SUBTLE, anchor="rm", max_w=mw, weight=MEDIUM)
+        c.text("انتهت قائمة التشغيل", tx, 130, 28, WHITE, anchor="rm", max_w=mw)
+        c.text("اطلب أغنية جديدة عبر أمر play", tx, 168, 17, SUBTLE, anchor="rm", max_w=mw, weight=MEDIUM)
     else:
-        c.text("يعمل الآن" if not paused else "متوقف مؤقتًا", tx, 92, 12.5, tuple(mix(t.accent, WHITE, 0.45)),
-               anchor="rm")
-        lines = c.wrap(title, 24, mw, 2)
+        c.chip("متوقف مؤقتًا" if paused else "يعمل الآن", tx, 98, "r", WARN if paused else t.accent, solid=True,
+               size=12.5, h=22, dot=False)
+        lines = c.wrap(title, 26, mw, 2)
+        y = 134
         for i, line in enumerate(lines):
-            c.text(line, tx, 120 + i * 30, 24, WHITE, anchor="rm", max_w=mw)
-        y = 120 + len(lines) * 30 - 4
+            c.text(line, tx, y + i * 33, 26, WHITE, anchor="rm", max_w=mw)
+        y += len(lines) * 33 + 2
         if artist:
-            c.text(("القناة: " if artist_is_channel else "الفنان: ") + name_of(artist, 28), tx, y + 10, 14.5, SUBTLE,
-                   anchor="rm", max_w=mw, weight=MEDIUM)
-            y += 24
-        c.text(f"بطلب من {name_of(requester, 20)}", tx, y + 12, 13.5, SUBTLE, anchor="rm", max_w=mw, weight=MEDIUM)
-    bar = (M + 14 + 46, 228, LW - M - 14 - 46, 237)
+            c.text(name_of(artist, 34), tx, y + 8, 17, tuple(mix(t.accent, WHITE, 0.5)), anchor="rm", max_w=mw)
+            y += 28
+        c.text(f"بطلب من {name_of(requester, 20)}", tx, y + 10, 14, SUBTLE, anchor="rm", max_w=mw, weight=MEDIUM)
+    # شريط التقدّم: يظهر فقط عندما يتوفر وقت فعلي (عدّاد إطارات الصوت المُرسَلة) ومدة معروفة
+    bar = (M + 16 + 50, 268, LW - M - 16 - 50, 277)
     if not idle and elapsed is not None and total > 0:
         c.rr(bar, 4.5, fill=(255, 255, 255, 34))
         frac = min(1.0, elapsed / total)
         w = max(9, (bar[2] - bar[0]) * frac)
         c.rr((bar[2] - w, bar[1], bar[2], bar[3]), 4.5, fill=tuple(WARN if paused else t.accent) + (255,))
-        c.text(_clock(elapsed), bar[2] + 24, 232.5, 12.5, WHITE)
-        c.text(_clock(total), bar[0] - 24, 232.5, 12.5, SUBTLE)
-    chips = [("المدة", duration if not idle else "—"), ("الصوت", f"{volume}%"), ("القائمة", str(queue_len))]
-    if loop:
-        chips.append(("التكرار", "مفعّل"))
-    w = (LW - 2 * M - 28 - (len(chips) - 1) * 10) / len(chips)
-    for i, (k, v) in enumerate(chips):
-        x1 = LW - M - 14 - i * (w + 10)
-        c.rr((x1 - w, 250, x1, 304), 14, fill=GLASS)
-        c.text(k, x1 - w / 2, 266, 12, SUBTLE, weight=MEDIUM)
-        c.text(v, x1 - w / 2, 288, 21, WHITE, max_w=w - 14)
-    if next_title and not idle:
-        c.text("التالي: " + next_title, LW / 2, 318, 12.5, SUBTLE, max_w=LW - 2 * M - 40, weight=MEDIUM)
+        c.circle(bar[2] - w, 272.5, 7, WHITE + (255,))
+        c.text(_clock(elapsed), bar[2] + 27, 272.5, 14, WHITE)
+        c.text(_clock(total), bar[0] - 27, 272.5, 14, SUBTLE)
+    elif not idle:
+        c.text(duration or "—", LW / 2, 272.5, 14, SUBTLE, weight=MEDIUM)
+    chips = [f"الصوت {volume}%", f"الطابور {queue_len}"] + (["تكرار مفعّل"] if loop else [])
+    x = LW - M - 16
+    for label in chips:
+        w = text_width(label, 13.5) + 26
+        c.rr((x - w, 296, x, 322), 13, fill=GLASS)
+        c.text(label, x - w / 2, 309, 13.5, WHITE)
+        x -= w + 8
     return c.png()
 
 

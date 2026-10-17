@@ -176,6 +176,51 @@ async def _panel_checks(db):
     await pick("reward_quiz", admin)
     assert (await db.get_settings(GUILD))["reward_quiz"] == SETTINGS_BY_KEY["reward_quiz"].default
 
+    # ---- تجربة الإدارة: شرح لكل إعداد، تجميع الأقسام، ما يحتاج انتباهك، الرئيسية والصوت
+    from bot.settings_schema import SETTING_HELP, describe, help_for
+    assert all(help_for(st) for st in SETTINGS), [st.key for st in SETTINGS if not help_for(st)]   # كل إعداد له شرح
+    assert not set(SETTING_HELP) - set(SETTINGS_BY_KEY)                                            # ولا شرح لإعداد غير موجود
+    assert all(describe(st) for st in SETTINGS)
+    view.section, view.mode = None, None
+    home = await view.build(admin)
+    names = [f.name for f in home.fields]
+    assert "🎮 الفعاليات والاقتصاد" in names and "🛡️ الحماية والإدارة" in names and "🔧 السيرفر والبوت" in names
+    attention = next(f for f in home.fields if f.name in ("🔔 ما يحتاج انتباهك", "✅ الحالة"))
+    assert "روم سجل السيرفر" in attention.value                                                   # لم يُضبط بعد
+    await db.set_setting(GUILD, "log_channel", 5)
+    await db.set_setting(GUILD, "games_channel", 6)
+    home = await view.build(admin)
+    assert next(f for f in home.fields if f.name in ("🔔 ما يحتاج انتباهك", "✅ الحالة")).name == "✅ الحالة"
+    await db.reset_setting(GUILD, "log_channel")
+    await db.reset_setting(GUILD, "games_channel")
+    assert not any(isinstance(c, panel_mod.ActionButton) and c.action == "home" for c in view.children)  # لا «رئيسية» في الرئيسية
+    view.section = panel_mod.SECTIONS_BY_KEY["games"]
+    await view.build(admin)
+    assert any(isinstance(c, panel_mod.ActionButton) and c.action == "home" for c in view.children)
+    assert any(isinstance(c, panel_mod.ActionButton) and c.action == "explain" for c in view.children)
+    for sec in panel_mod.SECTIONS:                                    # صفحات الشرح: حدود ديسكورد وشرح كل إعداد ظاهر
+        for page in panel_mod.settings_help_pages(sec, await db.get_settings(GUILD)):
+            assert len(page) <= 6000 and len(page.fields) <= 25, sec.key
+            assert all(len(f.value) <= 1024 for f in page.fields)
+    games_pages = panel_mod.settings_help_pages(panel_mod.SECTIONS_BY_KEY["games"], await db.get_settings(GUILD))
+    assert len(games_pages) >= 3 and "تفعيل" in games_pages[0].fields[0].value or games_pages[0].fields[0].value
+    # الزر «شرح الإعدادات» يفتح صفحات مخفية، ورتب الموسيقى تنقل لقسم الصلاحيات، والرئيسية ترجع
+    i = fake_interaction(admin)
+    i.original_response = AsyncMock()
+    await view.on_action(i, "explain")
+    i.response.send_message.assert_awaited()
+    view.section = panel_mod.SECTIONS_BY_KEY["music"]
+    await view.on_action(fake_interaction(admin), "music_perms")
+    assert view.section.key == "permissions" and view.mode == "perm_roles" and view.target == "music"
+    await view.on_action(fake_interaction(admin), "home")
+    assert view.section is None and view.mode is None
+    view.section = panel_mod.SECTIONS_BY_KEY["music"]
+    assert [st.key for st in panel_mod.section_settings(view.section)] == ["voice_home_channel"]
+    deny = fake_interaction(demoted)                                   # بلا صلاحية: لا يرى شرح قسم إداري
+    deny.original_response = AsyncMock()
+    await view.on_action(deny, "explain")
+    assert deny.original_response.await_count == 0
+
     # 6) نافذة المبلغ: عضو بلا صلاحية الاقتصاد لا يستطيع إضافة نقاط حتى لو أرسل النافذة
     target = fake_member(50)
     modal = panel_mod.PointsModal(view, "add", target)
@@ -2197,6 +2242,23 @@ async def test_music_system():
                 # ---- صلاحيات الأزرار من الخادم
                 view = player.panel_view
                 assert isinstance(view, mm.MusicPanelView)
+                # ---- ترتيب اللوحة: بطاقة ← صفا أزرار (الأساسية أولًا) ← فاصل ← الطابور
+                box = view.children[0]
+                assert [type(k).__name__ for k in box.children] == ["MediaGallery", "ActionRow", "ActionRow",
+                                                                     "Separator", "TextDisplay"]
+                row1 = [b.label for b in box.children[1].children]
+                row2 = [b.label for b in box.children[2].children]
+                assert row1 == ["السابق", "إيقاف مؤقت", "تخطي", "إيقاف"] and "القائمة الكاملة" in row2
+                assert box.children[1].children[1].style == discord.ButtonStyle.primary        # زر التشغيل/الإيقاف بارز
+                assert box.children[1].children[3].style == discord.ButtonStyle.danger
+                assert len(list(view.walk_children())) < 40                                    # حد مكوّنات ديسكورد
+                qt = mm.GuildPlayer.queue_text(SimpleNamespace(
+                    queue=__import__("collections").deque(mk_track(owner, i) for i in range(10, 18)), current=tracks[2]))
+                assert qt.splitlines()[0].startswith("### 📃 الطابور · 8 أغنية")
+                assert "▶️ **الآن** · Song3" in qt and "` 1` Song10" in qt and "` 5` Song14" in qt
+                assert "Song15" not in qt and "و 3 أغنية أخرى" in qt                           # خمس فقط ثم عدّاد الباقي
+                empty = mm.GuildPlayer.queue_text(SimpleNamespace(queue=__import__("collections").deque(), current=None))
+                assert "لا توجد أغانٍ قادمة" in empty
 
                 async def press(user, action, gid=GUILD):
                     i = fake_interaction(user, gid)
@@ -2265,7 +2327,9 @@ async def test_music_system():
                 player.current.fetched_at = _time.monotonic()
                 vc.finish()
                 await until(lambda: GUILD not in cog.players, timeout=8)
-                assert vc.disconnected and panel_msg.edit.await_args.kwargs["view"] is None
+                idle_view = panel_msg.edit.await_args.kwargs["view"]          # لوحة «انتهت»: بطاقة فقط بلا أزرار
+                assert vc.disconnected and isinstance(idle_view, mm.MusicPanelView)
+                assert not [b for b in idle_view.walk_children() if isinstance(b, discord.ui.Button)]
                 mm.IDLE_TIMEOUT = 180
 
                 # ---- مع الاتصال الدائم: لا يغادر أبدًا
