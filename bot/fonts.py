@@ -127,7 +127,9 @@ def chain(weight: str = BOLD) -> tuple[Face, ...]:
 
 @lru_cache(maxsize=256)
 def load(face: Face, size: int) -> ImageFont.FreeTypeFont:
-    font = ImageFont.truetype(face.path, max(1, int(size)))
+    # التشكيل وترتيب الاتجاه (bidi) نفّذناهما بأنفسنا في shape(): نفرض المحرك الأساسي حتى لا تعيد raqm ترتيب النص
+    # على أجهزة تتوفر فيها (لينكس/ماك) فيظهر العربي معكوسًا ومفكّك الحروف.
+    font = ImageFont.truetype(face.path, max(1, int(size)), layout_engine=ImageFont.Layout.BASIC)
     if face.variation:
         try:
             font.set_variation_by_name(face.variation)

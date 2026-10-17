@@ -1,10 +1,11 @@
-"""نقطة تشغيل البوت."""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import sys
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import discord
 from discord import app_commands
@@ -71,9 +72,9 @@ class ServerBot(commands.Bot):
         for cog in COGS:
             await self.load_extension(cog)
         self.tree.on_error = self.on_app_command_error
-        registry.apply_docs(self.tree)                       # أوصاف واضحة لكل أمر وخيار
+        registry.apply_docs(self.tree)                       
         guild_id = os.getenv("GUILD_ID")
-        if guild_id:                                         # أوصاف خصصها المسؤول وحُفظت سابقًا
+        if guild_id:                                         
             registry.apply_overrides(self.tree, await self.db.command_configs(int(guild_id)))
         if guild_id:
             guild = discord.Object(id=int(guild_id))
@@ -89,11 +90,6 @@ class ServerBot(commands.Bot):
         self.expire_roles.start()
 
     async def _remove_stale_global_commands(self) -> None:
-        """سبب ظهور الأوامر مرتين: أوامر عالمية قديمة (من تشغيل سابق بلا GUILD_ID) + نسخة السيرفر الحالية.
-
-        عند استخدام GUILD_ID يكون نطاق التسجيل المقصود هو السيرفر، فتُحذف النسخة العالمية القديمة فقط
-        (لا تُمسّ أوامر السيرفر ولا تعريفات الكود). للإبقاء عليها ضع KEEP_GLOBAL_COMMANDS=1 في .env.
-        """
         if os.getenv("KEEP_GLOBAL_COMMANDS") == "1":
             return
         try:
@@ -116,9 +112,7 @@ class ServerBot(commands.Bot):
         log.info("Logged in as %s (%s) — %d servers", self.user, self.user.id, len(self.guilds))
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="/help"))
 
-    # ------------------------------------------------------------------ السجلات
     async def send_log(self, guild: discord.Guild, kind: str, embed: discord.Embed) -> None:
-        """kind: log | mod | economy — يرسل للروم المحدد، ويرجع لروم السجل العام إن لم يُحدد."""
         settings = await self.db.get_settings(guild.id)
         channel_id = settings.get(f"{kind}_log_channel") if kind != "log" else settings["log_channel"]
         channel_id = channel_id or settings["log_channel"]
@@ -131,14 +125,12 @@ class ServerBot(commands.Bot):
             except discord.HTTPException:
                 pass
 
-    # ------------------------------------------------------------------ انتهاء الرتب المؤقتة
     @tasks.loop(minutes=1)
     async def expire_roles(self):
-        # أي خطأ غير معالج يوقف tasks.loop نهائيًا، لذلك يُعزل كل طلب على حدة
         for p in await self.db.expired_role_purchases():
             try:
                 await self._expire_one(p)
-            except Exception:  # noqa: BLE001
+            except Exception:  
                 log.exception("Failed to expire purchase #%s", p["id"])
 
     async def _expire_one(self, p) -> None:
@@ -161,7 +153,6 @@ class ServerBot(commands.Bot):
     async def _before_expire(self):
         await self.wait_until_ready()
 
-    # ------------------------------------------------------------------ الأخطاء
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, CommandDisabled):
             msg = "هذا الأمر معطّل حاليًا من الإدارة."
@@ -191,6 +182,24 @@ class ServerBot(commands.Bot):
             pass
 
 
+# ------------------------------------------------------------------ خادم الويب (Render Port Handler)
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is running online 24/7!\n')
+        
+    def log_message(self, format, *args):
+        pass
+
+def run_web_server():
+    port = int(os.environ.get('PORT', 3000))
+    server_address = ('0.0.0.0', port)
+    httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
+    httpd.serve_forever()
+
+
 async def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token or token.startswith("ضع"):
@@ -199,6 +208,10 @@ async def main():
                                               ".bot.lock")):
         sys.exit("\n[X] The bot is already running (another copy holds the lock). Close it first, "
                  "or you will get duplicated replies and voice conflicts.\n")
+    
+    # تشغيل خادم الويب في الخلفية ليظل Render مرتاحاً
+    threading.Thread(target=run_web_server, daemon=True).start()
+
     bot = ServerBot()
     try:
         async with bot:
