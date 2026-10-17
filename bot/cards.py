@@ -230,33 +230,63 @@ def render_store(*, items: Sequence[dict], images: dict[int, Optional[bytes]], b
 
 
 # ---------------------------------------------------------------------- الموسيقى
+def _clock(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02}:{sec:02}" if h else f"{m}:{sec:02}"
+
+
 def render_nowplaying(*, title: str, requester: str, duration: str, thumbnail: Optional[bytes], queue_len: int,
-                      volume: int, loop: bool, guild_name: str, status: str = "يعمل الآن") -> bytes:
+                      volume: int, loop: bool, guild_name: str, status: str = "يعمل الآن", artist: Optional[str] = None,
+                      artist_is_channel: bool = False, elapsed: Optional[float] = None, total: int = 0,
+                      paused: bool = False, next_title: Optional[str] = None, idle: bool = False) -> bytes:
+    """لوحة الموسيقى: غلاف، عنوان، فنان/قناة، تقدّم (فقط عند توفر وقت فعلي)، حالة، صوت، قائمة، والتالي."""
     c = Canvas("music")
     t = c.theme
-    c.header(None, False, status)
-    c.rr((22, 52, LW - 22, 336), 24, fill=PANEL + (232,), outline=t.accent + (170,), width=2)
-    box = (36, 70, 36 + 252, 70 + 142)
-    im = _cover(thumbnail, px(box[2] - box[0]), px(box[3] - box[1])) if thumbnail else None
+    c.header(None, False, "متوقف مؤقتًا" if paused else ("لا شيء يعمل" if idle else status))
+    c.rr((22, 52, LW - 22, 338), 24, fill=PANEL + (232,), outline=(AMBER if paused else t.accent) + (170,), width=2)
+    box = (34, 66, 34 + 240, 66 + 135)
+    im = _cover(thumbnail, px(box[2] - box[0]), px(box[3] - box[1])) if thumbnail and not idle else None
     if im is not None:
         _paste_rounded(c, im, box, 14)
     else:
         c.rr(box, 14, fill=mix(PANEL, t.accent, 0.22) + (255,))
-        c.circle(162, 141, 34, None, t.accent + (255,), 3)
-        c.poly([(150, 124), (150, 158), (180, 141)], t.accent + (255,))
+        c.circle(154, 133, 32, None, t.accent + (255,), 3)
+        c.poly([(142, 117), (142, 149), (170, 133)], t.accent + (255,))
+    if paused:   # علامة «إيقاف مؤقت» فوق الغلاف
+        c.rr(box, 14, fill=(8, 7, 18, 140))
+        c.rr((133, 108, 147, 158), 4, fill=WHITE + (255,))
+        c.rr((161, 108, 175, 158), 4, fill=WHITE + (255,))
     tx = LW - 40
-    lines = c.wrap(title, 25, 296, 3)
-    for i, line in enumerate(lines):
-        c.text(line, tx, 100 + i * 34, 25, WHITE, anchor="rm", max_w=296)
-    c.text(f"بطلب من {name_of(requester, 20)}", tx, 100 + len(lines) * 34 + 6, 15, MUTED, anchor="rm", shadow=False,
-           max_w=296)
-    chips = [("المدة", duration), ("الصوت", f"{volume}%"), ("القائمة", str(queue_len))]
+    if idle:
+        c.text("انتهت قائمة التشغيل", tx, 110, 26, WHITE, anchor="rm", max_w=300)
+        c.text("اطلب أغنية جديدة بـ /play", tx, 146, 16, MUTED, anchor="rm", shadow=False)
+    else:
+        lines = c.wrap(title, 24, 296, 2)
+        for i, line in enumerate(lines):
+            c.text(line, tx, 88 + i * 31, 24, WHITE, anchor="rm", max_w=296)
+        y = 88 + len(lines) * 31 + 4
+        if artist:
+            c.text(("القناة: " if artist_is_channel else "الفنان: ") + name_of(artist, 28), tx, y + 4, 15, SOFT,
+                   anchor="rm", shadow=False, max_w=296)
+            y += 26
+        c.text(f"بطلب من {name_of(requester, 20)}", tx, y + 6, 14.5, MUTED, anchor="rm", shadow=False, max_w=296)
+    # شريط التقدم: يظهر فقط عندما يتوفر وقت فعلي (عدّاد إطارات الصوت المُرسَلة) ومدة معروفة
+    if not idle and elapsed is not None and total > 0:
+        frac = min(1.0, elapsed / total)
+        c.progress((34 + 52, 214, LW - 34 - 52, 224), frac, AMBER if paused else t.accent)
+        c.text(_clock(elapsed), LW - 34 - 24, 219, 13, SOFT, shadow=False)
+        c.text(_clock(total), 34 + 24, 219, 13, MUTED, shadow=False)
+    chips = [("المدة", duration if not idle else "—"), ("الصوت", f"{volume}%"), ("القائمة", str(queue_len))]
     if loop:
         chips.append(("التكرار", "مفعّل"))
-    w = (LW - 72 - (len(chips) - 1) * 10) / len(chips)
+    w = (LW - 68 - (len(chips) - 1) * 10) / len(chips)
     for i, (k, v) in enumerate(chips):
-        x1 = LW - 36 - i * (w + 10)
-        c.stat((x1 - w, 236, x1, 306), k, v, WHITE, 24)
+        x1 = LW - 34 - i * (w + 10)
+        c.stat((x1 - w, 238, x1, 300), k, v, WHITE, 22)
+    if next_title and not idle:
+        c.text("التالي: " + next_title, LW / 2, 318, 14, MUTED, shadow=False, max_w=LW - 90)
     c.footer(guild_name)
     return c.png()
 

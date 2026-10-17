@@ -2026,6 +2026,517 @@ def test_warnings_card():
     print("OK warnings card: 1280x720 with long text, empty list, bad avatar, all severity levels")
 
 
+# ====================================================================== الموسيقى: قائمة ولوحة تحكم
+class FakeVC:
+    """عميل صوت وهمي يحاكي سلوك discord.VoiceClient (تشغيل/إيقاف/استئناف/إيقاف نهائي + عدّاد الإطارات)."""
+
+    def __init__(self, guild, channel):
+        self.guild, self.channel = guild, channel
+        self._connected, self._playing, self._paused = True, False, False
+        self.source = self.after = None
+        self._player = SimpleNamespace(loops=0)
+        self.played, self.disconnected = [], False
+        self.play_error = None
+
+    def is_connected(self):
+        return self._connected
+
+    def is_playing(self):
+        return self._playing and not self._paused
+
+    def is_paused(self):
+        return self._paused
+
+    def play(self, source, after=None):
+        if self.play_error:
+            raise self.play_error
+        if self._playing:
+            raise discord.ClientException("Already playing audio.")
+        self.source, self._playing, self._paused, self.after = source, True, False, after
+        self._player = SimpleNamespace(loops=0)
+        self.played.append(source)
+
+    def stop(self):
+        if self._playing:
+            self._playing = self._paused = False
+            cb, self.after = self.after, None
+            if cb:
+                cb(None)
+
+    def pause(self):
+        if self._playing:
+            self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    async def disconnect(self, force=False):
+        self._connected, self.disconnected = False, True
+        self.guild.voice_client = None
+
+    def finish(self, error=None):
+        """انتهاء الأغنية طبيعيًا (أو بخطأ من ffmpeg)."""
+        self._playing = self._paused = False
+        cb, self.after = self.after, None
+        if cb:
+            cb(error)
+
+
+async def until(cond, timeout=6.0):
+    t = asyncio.get_running_loop().time()
+    while not cond():
+        if asyncio.get_running_loop().time() - t > timeout:
+            raise AssertionError("condition not reached in time")
+        await asyncio.sleep(0.02)
+
+
+def music_world(bot, gid=GUILD):
+    """سيرفر + روم صوتي + روم نصي + عميل صوت وهمي."""
+    guild = MagicMock()
+    guild.id, guild.name = gid, f"G{gid}"
+    guild.me = MagicMock()
+    chan = MagicMock(spec=discord.VoiceChannel)
+    chan.id, chan.mention = 7000 + gid % 1000, "<#7>"
+    chan.members = [SimpleNamespace(bot=True, id=999)]
+    chan.permissions_for = lambda _m: discord.Permissions.all()
+    chan.connect = AsyncMock()
+    guild.voice_client = FakeVC(guild, chan)
+    guild.get_channel = lambda cid: None
+    text = MagicMock()
+    panel_msg = MagicMock()
+    panel_msg.edit = AsyncMock()
+    text.send = AsyncMock(return_value=panel_msg)
+    return guild, chan, text, panel_msg
+
+
+def listener(uid, chan, *, roles=(), admin=False):
+    m = fake_member(uid, admin=admin, role_ids=roles)
+    m.voice = SimpleNamespace(channel=chan)
+    m.display_name = f"u{uid}"
+    chan.members.append(m)
+    return m
+
+
+def mk_track(user, n, dur=200):
+    mm_ = sys.modules["cogs.music"]
+    return mm_.Track(f"Song{n}", f"https://y/{n}", f"s{n}", dur, None, user, __import__("time").monotonic())
+
+
+async def test_music_system():
+    import time as _time
+    from bot.checks import NoPermission
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            cog = bot.get_cog("Music")
+            mm = sys.modules[type(cog).__module__]
+            bot._connection.user = SimpleNamespace(id=999)
+
+            class DummySource(discord.AudioSource):
+                def __init__(self, stream, **_):
+                    self.stream = stream
+
+                def read(self):
+                    return b""
+
+                def is_opus(self):
+                    return False
+
+                def cleanup(self):
+                    pass
+
+            real_ff, real_fetch_img = mm.discord.FFmpegPCMAudio, mm.images.fetch
+            mm.discord.FFmpegPCMAudio = DummySource
+            mm.images.fetch = AsyncMock(return_value=None)
+            try:
+                guild, chan, text, panel_msg = music_world(bot)
+                owner = listener(40, chan)
+                other = listener(41, chan)
+                staff = listener(42, chan, roles=(700,))
+                await db.set_perm_roles(GUILD, "music", [700])
+                outsider = fake_member(43)
+                outsider.voice = None
+                player = cog.get_player(guild)
+                player.text_channel = text
+                vc = guild.voice_client
+                tracks = [mk_track(owner, i) for i in (1, 2, 3)]
+
+                # ---- تتابع تلقائي + لوحة واحدة تُحدَّث بالتعديل لا برسائل جديدة
+                for t in tracks:
+                    assert player.enqueue(t) is not None
+                await until(lambda: player.current is tracks[0] and vc.played)
+                await until(lambda: text.send.await_count == 1)
+                sent = text.send.await_args.kwargs
+                assert isinstance(sent["view"], mm.MusicPanelView) and sent["file"].filename == "nowplaying.png"
+                vc.finish()
+                await until(lambda: player.current is tracks[1])
+                vc.finish()
+                await until(lambda: player.current is tracks[2])
+                assert text.send.await_count == 1 and panel_msg.edit.await_count >= 2   # تحديث في المكان
+                assert [t.title for t in player.history] == ["Song1", "Song2"]
+                # ---- السابق: تعود 2 ثم تكمل 3 من جديد، ولا تتكرر في التاريخ
+                assert player.previous()
+                await until(lambda: player.current is tracks[1] and len(vc.played) == 4)
+                vc.finish()
+                await until(lambda: player.current is tracks[2] and len(vc.played) == 5)
+                assert [t.title for t in player.history] == ["Song1", "Song2"]
+                # ---- إيقاف مؤقت/استئناف يعكسان الحالة الفعلية، ووقت التشغيل من إطارات الصوت
+                vc._player.loops = 500
+                assert abs(player.elapsed() - 10.0) < 1e-9
+                assert player.toggle_pause() is True and vc.is_paused() and player.paused
+                assert player.toggle_pause() is False and vc.is_playing() and not player.paused
+                vc._player = None
+                assert player.elapsed() is None                       # لا نعرض تقدمًا غير دقيق
+                vc._player = SimpleNamespace(loops=0)
+                # ---- الصوت: خطوات وحدود، ويطبَّق فورًا على المصدر الجاري
+                assert player.set_volume(65) == 65 and abs(vc.source.volume - 0.65) < 1e-9
+                assert player.set_volume(1) == mm.MIN_VOLUME and player.set_volume(999) == mm.MAX_VOLUME
+                player.set_volume(50)
+
+                # ---- صلاحيات الأزرار من الخادم
+                view = player.panel_view
+                assert isinstance(view, mm.MusicPanelView)
+
+                async def press(user, action, gid=GUILD):
+                    i = fake_interaction(user, gid)
+                    i.user = user
+                    await view.handle(i, action)
+                    denied = (i.response.send_message.await_args is not None and
+                              "غير مسموح" in str(i.response.send_message.await_args.kwargs.get("embed").to_dict())
+                              if i.response.send_message.await_args else False)
+                    return denied
+
+                assert await press(outsider, "pause") and await press(owner, "pause", gid=999) is True      # خارج الروم/سيرفر آخر
+                assert not await press(other, "pause") and vc.is_paused()                                # أي مستمع يوقف مؤقتًا
+                assert not await press(other, "pause") and vc.is_playing()                               # ويستأنف
+                for action in ("skip", "stop", "loop", "vol_up", "vol_down", "previous"):
+                    assert await press(other, action), action                                            # مستمع عادي: ممنوع
+                assert player.current is tracks[2] and not player.loop and abs(player.volume - 0.5) < 1e-9
+                assert not await press(staff, "vol_up") and abs(player.volume - 0.6) < 1e-9              # صاحب صلاحية الموسيقى
+                assert not await press(staff, "vol_down") and abs(player.volume - 0.5) < 1e-9
+                assert not await press(owner, "loop") and player.loop                                   # صاحب الأغنية
+                assert not await press(owner, "loop") and not player.loop
+                assert not await press(owner, "refresh")
+                # البوت وحده مع شخص واحد: يتحكم
+                chan.members[:] = [SimpleNamespace(bot=True, id=999), other]
+                assert not await press(other, "vol_up") and abs(player.volume - 0.6) < 1e-9
+                chan.members[:] = [SimpleNamespace(bot=True, id=999), owner, other, staff]
+                # تخطي بصاحب الأغنية: ينتقل للنهاية ثم القائمة فارغة
+                assert not await press(owner, "skip")
+                await until(lambda: player.current is None)
+                assert [t.title for t in player.history][-1] == "Song3"
+
+                # ---- فشل بدء تشغيل أغنية (مصدر معطوب): رسالة واضحة ثم الانتقال للتالية
+                bad, good = mk_track(owner, 90), mk_track(owner, 91)
+                bad.fetched_at = good.fetched_at = _time.monotonic()
+                mm.discord.FFmpegPCMAudio = lambda stream, **k: (_ for _ in ()).throw(RuntimeError("ffmpeg died")) \
+                    if stream == "s90" else DummySource(stream)
+                text.send.reset_mock()
+                player.enqueue(bad)
+                player.enqueue(good)
+                await until(lambda: player.current is good)
+                notes = [c.kwargs.get("embed") for c in text.send.await_args_list if c.kwargs.get("embed")]
+                assert any("Song90" in (e.description or "") and "تعذّر" in (e.description or "") for e in notes)
+                # خطأ أثناء التشغيل نفسه (انهيار ffmpeg): إشعار ثم متابعة
+                text.send.reset_mock()
+                nxt = mk_track(owner, 92)
+                nxt.fetched_at = _time.monotonic()
+                player.enqueue(nxt)
+                vc.finish(error=RuntimeError("stream broke"))
+                await until(lambda: player.current is nxt)
+                assert any("تعطل التشغيل" in (c.kwargs["embed"].title or "") for c in text.send.await_args_list
+                           if c.kwargs.get("embed"))
+                mm.discord.FFmpegPCMAudio = DummySource
+                # خطأ من vc.play نفسه
+                vc.finish()
+                await until(lambda: player.current is None)
+                vc.play_error = discord.ClientException("Already playing audio.")
+                bad2 = mk_track(owner, 93)
+                bad2.fetched_at = _time.monotonic()
+                player.enqueue(bad2)
+                await until(lambda: player.current is None and not player.queue)
+                vc.play_error = None
+
+                # ---- انتهاء القائمة: تتحول اللوحة لحالة «انتهت» وتُرفع الأزرار، ويغادر البوت (لا اتصال دائم)
+                mm.IDLE_TIMEOUT = 0.3
+                player.enqueue(mk_track(owner, 94))
+                await until(lambda: player.current is not None)
+                player.current.fetched_at = _time.monotonic()
+                vc.finish()
+                await until(lambda: GUILD not in cog.players, timeout=8)
+                assert vc.disconnected and panel_msg.edit.await_args.kwargs["view"] is None
+                mm.IDLE_TIMEOUT = 180
+
+                # ---- مع الاتصال الدائم: لا يغادر أبدًا
+                guild2, chan2, text2, panel2 = music_world(bot, gid=GUILD + 1)
+                home = MagicMock(spec=discord.VoiceChannel)
+                home.id = 5151
+                guild2.get_channel = lambda cid: home if cid == 5151 else None
+                await db.set_setting(GUILD + 1, "voice_home_channel", 5151)
+                p2 = cog.get_player(guild2)
+                p2.text_channel = text2
+                u2 = listener(60, chan2)
+                p2.enqueue(mk_track(u2, 1))
+                await until(lambda: p2.current is not None)
+                await p2.destroy("x")
+                assert not guild2.voice_client.disconnected
+
+                # ---- عزل السيرفرات: لكل سيرفر مشغّل وقائمة مستقلان
+                g3, c3, t3, _ = music_world(bot, gid=GUILD + 2)
+                g4, c4, t4, _ = music_world(bot, gid=GUILD + 3)
+                pa, pb = cog.get_player(g3), cog.get_player(g4)
+                assert pa is not pb and cog.get_player(g3) is pa
+                pa.enqueue(mk_track(owner, 1))
+                assert len(pa.queue) + (1 if pa.current else 0) == 1 and not pb.queue and pb.current is None
+                for pl in (pa, pb):
+                    await pl.destroy()
+            finally:
+                mm.discord.FFmpegPCMAudio, mm.images.fetch = real_ff, real_fetch_img
+                mm.IDLE_TIMEOUT = 180
+                for pl in list(cog.players.values()):
+                    pl.task.cancel()
+                cog.players.clear()
+        finally:
+            await db.close()
+    print("OK music player: sequential play, in-place panel updates, previous/history, pause/resume, real elapsed, "
+          "volume limits, per-button server-side permissions, failure recovery, idle exit, 24/7 stays, per-guild isolation")
+
+
+async def test_music_queue_and_commands():
+    from bot.checks import NoPermission
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            cog = bot.get_cog("Music")
+            mm = sys.modules[type(cog).__module__]
+            bot._connection.user = SimpleNamespace(id=999)
+            guild, chan, text, panel_msg = music_world(bot)
+            owner = listener(40, chan)
+            staff = listener(42, chan, roles=(700,))
+            normal = listener(44, chan)
+            await db.set_perm_roles(GUILD, "music", [700])
+            player = cog.get_player(guild)
+            player.task.cancel()                       # لا نريد التشغيل الفعلي هنا: نختبر القائمة فقط
+            player.text_channel = text
+            tr = [mk_track(owner, i) for i in range(1, 26)]
+            for t in tr:
+                assert player.enqueue(t)
+            assert [t.title for t in player.queue][:3] == ["Song1", "Song2", "Song3"]            # ترتيب الطلبات
+            # حد القائمة
+            for i in range(100):
+                player.enqueue(mk_track(owner, 100 + i))
+            assert len(player.queue) == mm.MAX_QUEUE and player.enqueue(mk_track(owner, 999)) is None
+            player.clear_queue()
+            for t in tr:
+                player.enqueue(t)
+            player.current = mk_track(owner, 0)
+
+            # ---- /queue و /music queue: صفحات حية (25 أغنية = 3 صفحات)
+            def inter(user):
+                i = fake_interaction(user)
+                i.user = user
+                i.guild = guild
+                i.client = bot
+                i.original_response = AsyncMock(return_value=MagicMock())
+                return i
+
+            i = inter(normal)
+            await cog.queue_alias.callback(cog, i)
+            kw = i.response.send_message.await_args.kwargs
+            assert "25" in kw["embed"].title and "الآن" in kw["embed"].description and kw["view"] is not None
+            view = kw["view"]
+            assert view.pages == 3 and not any(isinstance(c, mm._RemoveSelect) for c in view.children)   # لا إدارة للعادي
+            # التنقل
+            nav = inter(normal)
+            await view._make_nav(1)(nav)
+            assert "صفحة 2 من 3" in nav.response.edit_message.await_args.kwargs["embed"].footer.text
+            await view._make_nav(1)(nav)
+            await view._make_nav(1)(nav)
+            assert view.page == 2 and len(view._chunk()) == 5
+            # غير صاحب القائمة لا يستطيع استخدامها
+            assert not await view.interaction_check(fake_interaction(staff))
+            # المخوّل: يرى قائمة الحذف والمسح
+            i = inter(staff)
+            await cog.queue_alias.callback(cog, i)
+            mview = i.response.send_message.await_args.kwargs["view"]
+            assert any(isinstance(c, mm._RemoveSelect) for c in mview.children) and len(mview.children) <= 25
+            target = list(player.queue)[3]
+            ri = inter(staff)
+            await mview.remove(ri, target.uid)
+            assert target not in player.queue and len(player.queue) == 24
+            # محاولة حذف مزوَّرة من عضو عادي عبر نفس الواجهة: تُرفض من الخادم
+            fake_view = mm.QueueView(cog, player, normal, can_manage=True)       # لو ظهر الزر لسبب ما
+            ri = inter(normal)
+            await fake_view.remove(ri, list(player.queue)[0].uid)
+            assert len(player.queue) == 24 and "صلاحية الموسيقى" in str(ri.response.send_message.await_args.kwargs["embed"].description)
+            ri = inter(normal)
+            await fake_view._clear(ri)
+            assert len(player.queue) == 24
+            # مسح القائمة بضغطتين
+            ci = inter(staff)
+            await mview._clear(ci)
+            assert len(player.queue) == 24 and mview.confirm_clear
+            ci = inter(staff)
+            await mview._clear(ci)
+            assert len(player.queue) == 0
+
+            # ---- /music remove و /music clear: صلاحية الموسيقى من الخادم
+            for cmd in (cog.remove, cog.clear):
+                for user, ok_ in ((normal, False), (staff, True)):
+                    ii = inter(user)
+                    try:
+                        allowed_ = await cmd._check_can_run(ii)
+                    except NoPermission:
+                        allowed_ = False
+                    assert allowed_ == ok_, (cmd.name, user.id)
+            for t in tr[:5]:
+                player.enqueue(t)
+            ii = inter(staff)
+            await cog.remove.callback(cog, ii, position=2)
+            assert [t.title for t in player.queue] == ["Song1", "Song3", "Song4", "Song5"]
+            ii = inter(staff)
+            await cog.remove.callback(cog, ii, position=50)
+            assert ii.response.send_message.await_args.kwargs["ephemeral"] is True and len(player.queue) == 4
+            ii = inter(staff)
+            await cog.clear.callback(cog, ii)
+            assert len(player.queue) == 0
+            ii = inter(staff)
+            await cog.clear.callback(cog, ii)
+            assert ii.response.send_message.await_args.kwargs["ephemeral"] is True
+            # قائمة فارغة وبلا مشغّل
+            cog.players.clear()
+            ii = inter(normal)
+            await cog.queue_alias.callback(cog, ii)
+            assert ii.response.send_message.await_args.kwargs["ephemeral"] is True
+            player.task.cancel()
+        finally:
+            for pl in list(bot.get_cog("Music").players.values()):
+                pl.task.cancel()
+            await db.close()
+    print("OK music queue: ordering, 100-track cap, live pages + navigation, admin remove/clear (select + confirm), "
+          "server-side permission on forged UI actions, /music remove & clear permission checks")
+
+
+async def test_music_rapid_requests_and_errors():
+    import random as _r
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        db = await temp_db(d)
+        try:
+            bot = await make_bot(db)
+            cog = bot.get_cog("Music")
+            mm = sys.modules[type(cog).__module__]
+            bot._connection.user = SimpleNamespace(id=999)
+            guild, chan, text, panel_msg = music_world(bot)
+            guild.voice_client = None                       # غير متصل: سيتصل عند أول طلب
+            user = listener(40, chan)
+            connects = []
+
+            async def connect(**kw):
+                connects.append(1)
+                await asyncio.sleep(0.05)                   # اتصال بطيء ليتداخل مع بقية الطلبات
+                if guild.voice_client is None:
+                    guild.voice_client = FakeVC(guild, chan)
+                else:
+                    raise discord.ClientException("Already connected to a voice channel.")
+
+            chan.connect = connect
+
+            def inter():
+                i = fake_interaction(user)
+                i.user = user
+                i.guild = guild
+                i.channel = text
+                i.followup = MagicMock()
+                i.followup.send = AsyncMock()
+                return i
+
+            real_fetch, real_ff = mm.fetch_track, mm.discord.FFmpegPCMAudio
+
+            class Dummy(discord.AudioSource):
+                def __init__(self, *a, **k): pass
+                def read(self): return b""
+                def is_opus(self): return False
+
+            mm.discord.FFmpegPCMAudio = Dummy
+            mm.images.fetch = AsyncMock(return_value=None)
+
+            async def fake_fetch(q, requester):
+                await asyncio.sleep(_r.random() * 0.1)
+                return mm.Track(q, f"https://y/{q}", "s", 100, None, requester, time_now())
+
+            def time_now():
+                import time as t_
+                return t_.monotonic()
+
+            mm.fetch_track = fake_fetch
+            try:
+                # 25 طلبًا متزامنًا: كلها تدخل القائمة دون ضياع أو تكرار، واتصال صوتي واحد فقط
+                await asyncio.gather(*[cog._play(inter(), f"q{i}") for i in range(25)])
+                player = cog.players[GUILD]
+                titles = [player.current.title] if player.current else []
+                titles += [t.title for t in player.queue]
+                assert sorted(titles) == sorted(f"q{i}" for i in range(25)), titles
+                assert len(set(t.uid for t in player.queue)) == len(player.queue) and len(connects) == 1
+                player.task.cancel()
+                # فشل البحث: رسالة مفهومة ولا اتصال ولا إضافة
+                mm.fetch_track = AsyncMock(side_effect=Exception("Video unavailable"))
+                before = len(player.queue)
+                i = inter()
+                await cog._play(i, "x")
+                assert "غير متاح" in i.followup.send.await_args.kwargs["embed"].description and len(player.queue) == before
+                # فشل الاتصال الصوتي بمهلة: رسالة مفهومة بلا إضافة
+                cog.players.clear()
+                guild.voice_client = None
+                mm.fetch_track = fake_fetch
+
+                async def slow_connect(**kw):
+                    raise asyncio.TimeoutError
+                chan.connect = slow_connect
+                i = inter()
+                await cog._play(i, "y")
+                assert "مهلة الاتصال" in i.followup.send.await_args.kwargs["embed"].description
+                assert not cog.players.get(GUILD) or not cog.players[GUILD].queue
+                # قائمة ممتلئة
+                chan.connect = connect
+                guild.voice_client = FakeVC(guild, chan)
+                p = cog.get_player(guild)
+                p.task.cancel()
+                for n in range(mm.MAX_QUEUE):
+                    p.enqueue(mm.Track(f"f{n}", "u", "s", 1, None, user, 0.0))
+                i = inter()
+                await cog._play(i, "overflow")
+                assert "ممتلئة" in i.followup.send.await_args.kwargs["embed"].description
+            finally:
+                mm.fetch_track, mm.discord.FFmpegPCMAudio = real_fetch, real_ff
+        finally:
+            for pl in list(bot.get_cog("Music").players.values()):
+                pl.task.cancel()
+            await db.close()
+    print("OK music requests: 25 concurrent /play keep every track once with a single voice connect, search/connect failures "
+          "give clear messages, full queue refused")
+
+
+def test_music_card():
+    from PIL import Image
+    from bot import cards
+    import io as _io
+    cases = [
+        dict(title="x" * 200, requester="سارة", duration="3:45", thumbnail=b"junk", queue_len=4, volume=50, loop=True,
+             guild_name="g", artist="فيروز", elapsed=95.5, total=225, paused=False, next_title="التالي " * 30),
+        dict(title="بث مباشر", requester="🔥", duration="مباشر", thumbnail=None, queue_len=0, volume=150, loop=False,
+             guild_name="g", artist="قناة", artist_is_channel=True, elapsed=None, total=0, paused=True),
+        dict(title="", requester="", duration="—", thumbnail=None, queue_len=0, volume=5, loop=False, guild_name="g",
+             idle=True),
+        dict(title="a", requester="b", duration="0:01", thumbnail=None, queue_len=1, volume=50, loop=False, guild_name="g",
+             elapsed=99999, total=1),   # تجاوز: لا ينهار الشريط
+    ]
+    for kw in cases:
+        assert Image.open(_io.BytesIO(cards.render_nowplaying(**kw))).size == (1280, 720)
+    print("OK music card: progress/paused/live/idle/overflow states at 1280x720")
+
+
 GUESSING = False
 test_game_logic()
 test_wheel()
@@ -2040,6 +2551,10 @@ asyncio.run(test_role_settings_in_panel())
 asyncio.run(test_warnings_db_and_migration())
 asyncio.run(test_warnings_commands())
 test_warnings_card()
+asyncio.run(test_music_system())
+asyncio.run(test_music_queue_and_commands())
+asyncio.run(test_music_rapid_requests_and_errors())
+test_music_card()
 test_info_cards()
 asyncio.run(test_info_commands_use_cards_with_fallback())
 asyncio.run(test_fast_game_and_trigger())
